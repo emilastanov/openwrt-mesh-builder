@@ -1,0 +1,9 @@
+# Generated images / topology
+images/*
+openwrt-imagebuilder-*
+
+# Local temporary staging
+.server-deploy-*
+.apk-meta-*
+.cert-*
+.validate-cert-*
