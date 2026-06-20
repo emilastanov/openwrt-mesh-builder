@@ -464,12 +464,16 @@ def generate_wireguard_client_files(
 # ============================================================
 
 
-def update_subnet_hostname_block(body: str, router: RouterDef) -> str:
-    managed = (
+def build_subnet_hostname_block(router: RouterDef) -> str:
+    return (
         "    # Set subnet and name\n"
         f"    uci -q set network.lan.ipaddr='{router.lan_ipaddr}'\n"
         f"    uci -q set system.@system[0].hostname='{router.hostname}'\n"
     )
+
+
+def update_subnet_hostname_block(body: str, router: RouterDef) -> str:
+    managed = build_subnet_hostname_block(router)
 
     pattern = re.compile(
         r"""(?ms)
@@ -488,13 +492,17 @@ def update_subnet_hostname_block(body: str, router: RouterDef) -> str:
     return managed + body
 
 
-def update_doh_source_addr_block(body: str, router: RouterDef) -> str:
+def build_doh_source_addr_block(router: RouterDef) -> str:
     source_addr = ipv4_without_prefix(router.lan_ipaddr)
-    managed = (
+    return (
         "    # Set DoH source address\n"
         f"    uci -q set https-dns-proxy.config.source_addr='{source_addr}'\n"
         "\n"
     )
+
+
+def update_doh_source_addr_block(body: str, router: RouterDef) -> str:
+    managed = build_doh_source_addr_block(router)
 
     pattern = re.compile(
         r"""(?ms)
@@ -625,11 +633,6 @@ def build_wifi_block(cfg: ConfigData, router_name: str) -> str:
     return "\n".join(lines).rstrip() + "\n\n"
 
 
-OPENVPN_BABELD_HOTPLUG_COMMENT_RE = re.compile(
-    r"^\s*#\s*Restart\s+babeld\s+when\s+generated\s+OpenVPN\s+access\s+interface\s+comes\s+up\s*$"
-)
-
-
 def router_has_openvpn_access(cfg: ConfigData, router_name: str) -> bool:
     return any(g.protocol == PROTOCOL_OPENVPN for g in cfg.access.get(router_name, []))
 
@@ -654,48 +657,12 @@ EOF
 """
 
 
-def skip_openvpn_babeld_hotplug_block(lines: list[str], start: int) -> int:
-    i = start + 1
-    saw_heredoc = False
-
-    while i < len(lines):
-        text = line_text(lines[i])
-
-        if text.strip() == "EOF":
-            saw_heredoc = True
-            i += 1
-            continue
-
-        if saw_heredoc:
-            if re.match(
-                r"^\s*chmod\s+\+x\s+/etc/hotplug\.d/iface/99-babeld-openvpn\s*$",
-                text,
-            ):
-                i += 1
-                continue
-            if not text.strip():
-                i += 1
-                continue
-            break
-
-        i += 1
-
-    return i
-
-
 def remove_openvpn_babeld_hotplug_block(body: str) -> str:
-    lines = body.splitlines(keepends=True)
-    out: list[str] = []
-    i = 0
-
-    while i < len(lines):
-        if OPENVPN_BABELD_HOTPLUG_COMMENT_RE.match(line_text(lines[i])):
-            i = skip_openvpn_babeld_hotplug_block(lines, i)
-            continue
-        out.append(lines[i])
-        i += 1
-
-    return "".join(out)
+    # Remove only the exact block that this generator writes.
+    # If a user edits that hotplug snippet by hand, it stays above the marker
+    # and show_unmanaged.py can report it as unmanaged instead of silently
+    # hiding a broad comment-to-chmod range.
+    return body.replace(build_openvpn_babeld_hotplug_block(), "")
 
 
 def update_openvpn_babeld_hotplug_block(
@@ -1624,7 +1591,8 @@ def write_server_ipsets(cfg: ConfigData, exit_name: str) -> None:
 
 def reconcile_server_dirs(keep_exit_names: set[str]) -> None:
     SERVER_ROOT.mkdir(parents=True, exist_ok=True)
-    protected = set(keep_exit_names) | {SERVER_TEMPLATE_NAME}
+    protected = {server_dir_name(name) for name in keep_exit_names}
+    protected.add(SERVER_TEMPLATE_NAME)
 
     for child in SERVER_ROOT.iterdir():
         if child.is_dir() and child.name not in protected:
@@ -2028,11 +1996,7 @@ def update_firewall_part(
             return False
         if typ == "rule":
             rule_name = str(options.get("name", ""))
-            if (
-                rule_name in rule_names_to_manage
-                or rule_name.startswith("Allow-Mesh-")
-                or rule_name.startswith("Allow-Exit-Reverse-")
-            ):
+            if rule_name in rule_names_to_manage:
                 return False
         return True
 

@@ -5,12 +5,18 @@ sys.dont_write_bytecode = True
 import argparse
 import contextlib
 import hashlib
+from collections import Counter
 import io
 import os
 import re
 from pathlib import Path
 from common import *
 from sync_rules import SYNC_COPY_DIRS, SYNC_COPY_FILES, SYNC_MERGE_FILES
+
+try:
+    import generate as gen
+except ImportError:
+    from . import generate as gen
 
 try:
     from .default import (
@@ -24,6 +30,7 @@ except ImportError:
     )
 
 EXPECTED_UNMANAGED_ROUTER_EXACT = {}
+EXPECTED_GENERATION_STATE_CACHE: dict[int, dict[str, dict[str, object]]] = {}
 
 
 def exit_reverse_firewall_rule_name(hub_name: str) -> str:
@@ -147,101 +154,298 @@ def expected_server_exact_paths(cfg: ConfigData) -> set[Path]:
 
 
 # ============================================================
-# MANAGED BLOCK LOGIC
+# STRICT GENERATED BLOCK LOGIC
 # ============================================================
 
 
-def is_managed_firewall(
+def uci_block_key(block: str) -> str:
+    # Ignore only inter-block separator newlines.  The bytes inside the UCI
+    # block itself, including indentation, option order and values, must match.
+    return block.strip("\n")
+
+
+def counter_from_uci_text(text: str) -> Counter[str]:
+    out: Counter[str] = Counter()
+    normalized = normalize_uci(text)
+
+    for block in split_uci_blocks(normalized):
+        if parse_uci_block(block):
+            out[uci_block_key(block)] += 1
+
+    return out
+
+
+def consume_expected_uci_block(expected: Counter[str], block: str) -> bool:
+    key = uci_block_key(block)
+    if expected.get(key, 0) <= 0:
+        return False
+    expected[key] -= 1
+    return True
+
+
+def expected_router_generation_state(
     cfg: ConfigData,
-    router_name: str,
-    parsed: dict[str, object],
-) -> bool:
-    typ = str(parsed.get("type", ""))
-    options = parsed.get("options", {})
-    block_name = str(options.get("name", ""))
+) -> dict[str, dict[str, object]]:
+    cached = EXPECTED_GENERATION_STATE_CACHE.get(id(cfg))
+    if cached is not None:
+        return cached
 
-    zone_names_to_manage = set(MANAGED_FIREWALL_ZONES) | {ZONE_EXIT_IPIP}
+    existing = load_existing_network_cfgs(cfg)
 
-    rule_names_to_manage: set[str] = {TRANSIT_ACCESS_DNS_RULE_NAME}
-    if cfg.exit_hubs and not config_has_allow_to_router_all(cfg):
-        rule_names_to_manage.add("Allow-SSH-From-Exit-To-Router")
+    access_blocks, _access_states, access_names = gen.build_access_state(
+        cfg=cfg,
+        existing_all=existing,
+        access_groups=cfg.access,
+        force=False,
+        verbose=False,
+    )
 
-    if router_name in cfg.mesh_hubs_by_name:
-        rule_names_to_manage.add(FIREWALL_RULE_ALLOW_MESH)
-        hub = cfg.mesh_hubs_by_name[router_name]
-        for _hub_name, target_name in mesh_link_specs_for_hub(cfg, router_name):
-            rule_names_to_manage.add(mesh_firewall_rule_name(hub.name, target_name))
-        for exit_hub in cfg.exit_hubs:
-            rule_names_to_manage.add(exit_reverse_firewall_rule_name(exit_hub.name))
+    mesh_blocks, mesh_ifaces, _mesh_states = gen.build_mesh_state(
+        cfg=cfg,
+        existing_all=existing,
+        force=False,
+        verbose=False,
+    )
 
-    for group in cfg.access.get(router_name, []):
-        rule_names_to_manage.add(f"Allow-{group.name}")
+    router_exit_blocks: dict[str, dict[str, str]] = {r: {} for r in cfg.router_names}
+    router_exit_ipip_blocks: dict[str, dict[str, str]] = {
+        r: {} for r in cfg.router_names
+    }
+    router_exit_ifaces: dict[str, list[str]] = {r: [] for r in cfg.router_names}
 
-    for allow in cfg.firewall_allows:
-        for target_name in expand_firewall_targets(cfg, allow):
-            if target_name == router_name:
-                rule_names_to_manage.add(
-                    firewall_allow_rule_name(allow.source_name, target_name, allow.kind)
+    for hub in cfg.exit_hubs:
+        for router_name in cfg.router_names:
+            router_cfg = existing[router_name]
+            blocks: list[str] = []
+
+            if gen.exit_hub_is_public(hub):
+                client_alias = build_exit_client_alias(cfg, hub.name, router_name)
+                link = compute_exit_link_params(cfg, hub, router_name)
+                awg = awg_for_infra_link(exit_link_key(hub.name, router_name))
+                iface_name = exit_out_iface_name(hub.name)
+                keys = gen.build_material_for_exit(
+                    router_name=router_name,
+                    hub=hub,
+                    client_alias=client_alias,
+                    router_iface_name=iface_name,
+                    router_cfg=router_cfg,
+                    force=False,
+                )
+                blocks.append(
+                    gen.build_exit_out_network_interface_block(hub, link, keys, awg)
+                )
+                router_exit_ifaces[router_name].append(iface_name)
+
+            if gen.router_is_public_mesh_hub(cfg, router_name):
+                client_alias = build_exit_reverse_client_alias(
+                    cfg, hub.name, router_name
+                )
+                link = compute_exit_reverse_link_params(cfg, hub, router_name)
+                awg = awg_for_infra_link(exit_reverse_link_key(hub.name, router_name))
+                iface_name = exit_in_iface_name(hub.name)
+                keys = gen.build_material_for_exit_reverse(
+                    hub=hub,
+                    client_alias=client_alias,
+                    router_iface_name=iface_name,
+                    router_cfg=router_cfg,
+                    force=False,
+                )
+                blocks.append(
+                    gen.build_exit_in_network_interface_block(hub, link, keys, awg)
+                )
+                router_exit_ifaces[router_name].append(iface_name)
+
+            if blocks:
+                router_exit_blocks[router_name][hub.name] = "\n".join(
+                    block.strip() for block in blocks
                 )
 
-    if typ == "zone" and block_name in zone_names_to_manage:
-        return True
+            router_exit_ipip_blocks[router_name][hub.name] = (
+                gen.build_exit_ipip_interface_block(cfg, router_name, hub)
+            )
 
-    if typ == "rule" and (
-        block_name in rule_names_to_manage
-        or block_name.startswith("Allow-Mesh-")
-        or block_name.startswith("Allow-Exit-Reverse-")
-    ):
-        return True
+    state: dict[str, dict[str, object]] = {}
 
-    return False
+    for router_name in cfg.router_names:
+        exit_text = "\n".join(
+            router_exit_blocks[router_name][hub.name].strip()
+            for hub in cfg.exit_hubs
+            if hub.name in router_exit_blocks[router_name]
+        ).strip()
+        ipip_text = "\n".join(
+            router_exit_ipip_blocks[router_name][hub.name].strip()
+            for hub in gen.router_exit_order_hubs(cfg, router_name)
+            if hub.name in router_exit_ipip_blocks[router_name]
+        ).strip()
 
+        network_text = "\n\n".join(
+            part
+            for part in (
+                access_blocks.get(router_name, "").strip(),
+                mesh_blocks[router_name].strip(),
+                exit_text,
+                ipip_text,
+            )
+            if part
+        )
 
-BOOTSTRAP_COMMON_RE = re.compile(
-    r"""
-    ^\s*
-    \#\!/bin/sh
-    \s*
-    customization\(\)\s*\{
-    \s*
-    \#\ Set\ subnet\ and\ name
-    \s*
-    uci\s+(?:-q\s+)?set\s+network\.lan\.ipaddr='[^']*'
-    \s*
-    uci\s+(?:-q\s+)?set\s+system\.@system\[0\]\.hostname='[^']*'
-    \s*
-    \}
-    \s*$
-    """,
-    re.X | re.S,
-)
+        exit_ifaces = sorted(set(router_exit_ifaces[router_name]))
+        active_exit_ipip_ifaces = sorted(
+            {
+                router_exit_ipip_iface_name(hub.name)
+                for hub in gen.router_exit_order_hubs(cfg, router_name)
+            }
+        )
+        firewall_text = build_expected_firewall_text(
+            cfg=cfg,
+            router_name=router_name,
+            mesh_ifaces=mesh_ifaces[router_name],
+            exit_ifaces=exit_ifaces,
+            exit_ipip_ifaces=active_exit_ipip_ifaces,
+            access_groups_for_router=cfg.access.get(router_name, []),
+        )
 
-BOOTSTRAP_MANAGED_LINE_PATTERNS = [
-    re.compile(r"^\s*#\s*Set\s+subnet\s+and\s+name\s*$"),
-    re.compile(r"^\s*uci\s+(?:-q\s+)?set\s+network\.lan\.ipaddr='[^']*'\s*$"),
-    re.compile(r"^\s*uci\s+(?:-q\s+)?set\s+system\.@system\[0\]\.hostname='[^']*'\s*$"),
-    re.compile(r"^\s*#\s*Set\s+DoH\s+source\s+address\s*$"),
-    re.compile(
-        r"^\s*uci\s+(?:-q\s+)?set\s+"
-        r"https-dns-proxy\.config\.source_addr='[^']*'\s*$"
-    ),
-]
+        state[router_name] = {
+            "network": counter_from_uci_text(network_text),
+            "firewall": counter_from_uci_text(firewall_text),
+        }
 
-BOOTSTRAP_FUNC_START_RE = re.compile(r"^\s*customization\s*\(\)\s*\{\s*$")
-
-BOOTSTRAP_WIFI_COMMENT_RE = re.compile(r"^\s*#\s*Set\s+Wi-Fi(?:\s+radio[01])?\s*$")
-
-BOOTSTRAP_WIFI_UCI_RE = re.compile(
-    r"^\s*uci\s+(?:-q\s+)?(?:set|delete|add_list)\s+"
-    r"wireless\.(?:radio[01]|default_radio[01])(?:\.|\b)"
-)
-
-BOOTSTRAP_DANGLING_SECRET_CLOSE_RE = re.compile(r"^\s*\}'\s*$")
+    EXPECTED_GENERATION_STATE_CACHE[id(cfg)] = state
+    return state
 
 
-BOOTSTRAP_OPENVPN_BABELD_HOTPLUG_COMMENT_RE = re.compile(
-    r"^\s*#\s*Restart\s+babeld\s+when\s+generated\s+OpenVPN\s+access\s+interface\s+comes\s+up\s*$"
-)
+def build_expected_firewall_text(
+    cfg: ConfigData,
+    router_name: str,
+    mesh_ifaces: list[str],
+    exit_ifaces: list[str],
+    exit_ipip_ifaces: list[str],
+    access_groups_for_router: list[AccessGroup],
+) -> str:
+    blocks: list[str] = []
+
+    if mesh_ifaces:
+        blocks.append(
+            gen.build_zone(
+                ZONE_MESH,
+                mesh_ifaces,
+                forward=FIREWALL_TARGET_ACCEPT,
+                mtu_fix=True,
+            ).strip()
+        )
+
+    if exit_ifaces:
+        blocks.append(
+            gen.build_zone(
+                ZONE_EXIT,
+                exit_ifaces,
+                forward=FIREWALL_TARGET_ACCEPT,
+                mtu_fix=True,
+            ).strip()
+        )
+
+    if exit_ipip_ifaces:
+        blocks.append(
+            gen.build_zone(
+                ZONE_EXIT_IPIP,
+                exit_ipip_ifaces,
+                forward=FIREWALL_TARGET_ACCEPT,
+                mtu_fix=True,
+            ).strip()
+        )
+
+    if exit_ifaces and not config_has_allow_to_router_all(cfg):
+        blocks.append(gen.build_rule_allow_ssh_from_exit_to_router().strip())
+
+    trusted_access_ifaces = sorted(
+        {g.name for g in access_groups_for_router if g.policy == ACCESS_POLICY_TRUSTED}
+    )
+    transit_access_ifaces = sorted(
+        {g.name for g in access_groups_for_router if g.policy == ACCESS_POLICY_TRANSIT}
+    )
+
+    if trusted_access_ifaces:
+        blocks.append(
+            gen.build_zone(
+                ZONE_TRUSTED_ACCESS,
+                trusted_access_ifaces,
+                input_policy=FIREWALL_TARGET_ACCEPT,
+                output_policy=FIREWALL_TARGET_ACCEPT,
+                forward=FIREWALL_TARGET_ACCEPT,
+                mtu_fix=True,
+            ).strip()
+        )
+
+    if transit_access_ifaces:
+        blocks.append(
+            gen.build_zone(
+                ZONE_TRANSIT_ACCESS,
+                transit_access_ifaces,
+                input_policy=FIREWALL_TARGET_REJECT,
+                output_policy=FIREWALL_TARGET_ACCEPT,
+                forward=FIREWALL_TARGET_ACCEPT,
+                mtu_fix=True,
+            ).strip()
+        )
+        blocks.append(gen.build_rule_allow_dns_transit_access().strip())
+
+    if router_name in cfg.mesh_hubs_by_name:
+        hub = cfg.mesh_hubs_by_name[router_name]
+
+        for _hub_name, target_name in mesh_link_specs_for_hub(cfg, router_name):
+            link = compute_mesh_link_params(cfg, hub, target_name)
+            blocks.append(
+                gen.build_rule_allow_port_wan(
+                    mesh_firewall_rule_name(hub.name, target_name),
+                    link.port,
+                    TRANSPORT_UDP,
+                ).strip()
+            )
+
+        for exit_hub in cfg.exit_hubs:
+            blocks.append(
+                gen.build_rule_allow_port_wan(
+                    exit_reverse_firewall_rule_name(exit_hub.name),
+                    gen.router_exit_listen_port(cfg, exit_hub, router_name),
+                    TRANSPORT_UDP,
+                ).strip()
+            )
+
+    for group in access_groups_for_router:
+        blocks.append(
+            gen.build_rule_allow_port_wan(
+                f"Allow-{group.name}",
+                group.port,
+                TRANSPORT_TCP if group.protocol == PROTOCOL_OPENVPN else TRANSPORT_UDP,
+            ).strip()
+        )
+
+    for allow in cfg.firewall_allows:
+        targets = expand_firewall_targets(cfg, allow)
+        if router_name not in targets:
+            continue
+
+        blocks.append(
+            gen.build_rule_allow_mesh_src_ip(
+                firewall_allow_rule_name(allow.source_name, router_name, allow.kind),
+                allow.source_subnet,
+                FIREWALL_ZONE_LAN if allow.kind == FIREWALL_ALLOW_KIND_LAN else None,
+            ).strip()
+        )
+
+    return "\n\n".join(blocks).strip()
+
+
+def exact_bootstrap_blocks(cfg: ConfigData, router_name: str) -> list[str]:
+    router = router_or_die(cfg, router_name)
+    blocks = [
+        gen.build_subnet_hostname_block(router),
+        gen.build_wifi_block(cfg, router_name),
+        gen.build_doh_source_addr_block(router),
+    ]
+    if gen.router_has_openvpn_access(cfg, router_name):
+        blocks.append(gen.build_openvpn_babeld_hotplug_block())
+    return blocks
 
 
 def strip_outer_blank_lines(lines: list[str]) -> list[str]:
@@ -252,148 +456,77 @@ def strip_outer_blank_lines(lines: list[str]) -> list[str]:
     return lines
 
 
-def bootstrap_line_text(line: str) -> str:
-    return line.rstrip("\r\n")
-
-
-def bootstrap_line_has_open_single_quote(line: str) -> bool:
-    return bootstrap_line_text(line).count("'") % 2 == 1
-
-
-def skip_bootstrap_wifi_block(lines: list[str], start: int) -> int:
-    i = start + 1
-    in_single_quote = False
-
-    while i < len(lines):
-        text = bootstrap_line_text(lines[i])
-
-        if in_single_quote:
-            if bootstrap_line_has_open_single_quote(lines[i]):
-                in_single_quote = False
-            i += 1
-            continue
-
-        if not text.strip():
-            i += 1
-            continue
-
-        if BOOTSTRAP_WIFI_COMMENT_RE.match(text):
-            i += 1
-            continue
-
-        if BOOTSTRAP_WIFI_UCI_RE.match(text):
-            in_single_quote = bootstrap_line_has_open_single_quote(lines[i])
-            i += 1
-            continue
-
-        if BOOTSTRAP_DANGLING_SECRET_CLOSE_RE.match(text):
-            i += 1
-            continue
-
-        break
-
-    return i
-
-
-def strip_managed_bootstrap_wifi_blocks(lines: list[str]) -> list[str]:
-    kept: list[str] = []
-    i = 0
-
-    while i < len(lines):
-        if BOOTSTRAP_WIFI_COMMENT_RE.match(bootstrap_line_text(lines[i])):
-            i = skip_bootstrap_wifi_block(lines, i)
-            continue
-        kept.append(lines[i])
-        i += 1
-
-    return kept
-
-
-def skip_bootstrap_openvpn_babeld_hotplug_block(lines: list[str], start: int) -> int:
-    i = start + 1
-    saw_heredoc = False
-
-    while i < len(lines):
-        text = bootstrap_line_text(lines[i])
-
-        if text.strip() == "EOF":
-            saw_heredoc = True
-            i += 1
-            continue
-
-        if saw_heredoc:
-            if re.match(
-                r"^\s*chmod\s+\+x\s+/etc/hotplug\.d/iface/99-babeld-openvpn\s*$",
-                text,
-            ):
-                i += 1
-                continue
-            if not text.strip():
-                i += 1
-                continue
-            break
-
-        i += 1
-
-    return i
-
-
-def strip_managed_bootstrap_openvpn_babeld_hotplug_block(
+def strip_exact_bootstrap_block_once(
     lines: list[str],
-) -> list[str]:
-    kept: list[str] = []
+    block: str,
+) -> tuple[list[str], bool]:
+    block_lines = block.rstrip("\n").splitlines()
+    if not block_lines:
+        return lines, False
+
+    out: list[str] = []
     i = 0
+    removed = False
 
     while i < len(lines):
-        if BOOTSTRAP_OPENVPN_BABELD_HOTPLUG_COMMENT_RE.match(
-            bootstrap_line_text(lines[i])
-        ):
-            i = skip_bootstrap_openvpn_babeld_hotplug_block(lines, i)
+        if not removed and lines[i : i + len(block_lines)] == block_lines:
+            i += len(block_lines)
+            removed = True
             continue
-        kept.append(lines[i])
+        out.append(lines[i])
         i += 1
 
-    return kept
+    return out, removed
 
 
 def strip_managed_bootstrap(
     text_before_marker: str,
-    has_openvpn_access: bool,
+    cfg: ConfigData,
+    router_name: str,
 ) -> str:
     text = text_before_marker.strip()
 
     if not text:
         return ""
 
-    if BOOTSTRAP_COMMON_RE.fullmatch(text):
-        return ""
-
     lines = strip_outer_blank_lines(text_before_marker.splitlines())
 
-    # Drop the standard shell/function wrapper so the report shows only
-    # the actually custom commands above the marker.
+    # Drop only the standard shell/function wrapper.  Everything inside
+    # customization() is checked against exact generated snippets below.
     if lines and lines[0].strip() == "#!/bin/sh":
         lines = strip_outer_blank_lines(lines[1:])
 
-    if lines and BOOTSTRAP_FUNC_START_RE.match(lines[0]):
+    if lines and re.match(r"^\s*customization\s*\(\)\s*\{\s*$", lines[0]):
         lines = strip_outer_blank_lines(lines[1:])
         if lines and lines[-1].strip() == "}":
             lines = strip_outer_blank_lines(lines[:-1])
 
-    lines = strip_managed_bootstrap_wifi_blocks(lines)
-    if has_openvpn_access:
-        lines = strip_managed_bootstrap_openvpn_babeld_hotplug_block(lines)
+    for block in exact_bootstrap_blocks(cfg, router_name):
+        lines, _removed = strip_exact_bootstrap_block_once(lines, block)
+        lines = strip_outer_blank_lines(lines)
 
-    kept: list[str] = []
+    lines = strip_outer_blank_lines(lines)
 
-    for line in lines:
-        if any(p.match(line) for p in BOOTSTRAP_MANAGED_LINE_PATTERNS):
+    return "\n".join(lines).strip("\n")
+
+
+def collect_unmanaged_uci_blocks_exact(
+    text_before_marker: str,
+    expected: Counter[str],
+) -> list[str]:
+    out: list[str] = []
+
+    for block in split_uci_blocks(text_before_marker):
+        key = uci_block_key(block)
+        if not key.strip():
             continue
-        kept.append(line)
 
-    kept = strip_outer_blank_lines(kept)
+        if consume_expected_uci_block(expected, block):
+            continue
 
-    return "\n".join(kept).strip("\n")
+        out.append(key.rstrip())
+
+    return out
 
 
 # ============================================================
@@ -409,23 +542,8 @@ def collect_unmanaged_network_above_marker(
     text = read(path)
     before_marker, _ = split_text_by_marker(text, path)
 
-    access_names = {g.name for g in cfg.access.get(router_name, [])}
-    mesh_exit_names = managed_mesh_exit_ifaces(cfg, router_name)
-    out: list[str] = []
-
-    for block in split_uci_blocks(before_marker):
-        parsed = parse_uci_block(block)
-        if not parsed:
-            continue
-
-        if is_managed_network(parsed, mesh_exit_names):
-            continue
-        if is_managed_access(parsed, access_names):
-            continue
-
-        out.append(block.rstrip())
-
-    return out
+    expected = expected_router_generation_state(cfg)[router_name]["network"].copy()
+    return collect_unmanaged_uci_blocks_exact(before_marker, expected)
 
 
 def collect_unmanaged_firewall_above_marker(
@@ -436,18 +554,8 @@ def collect_unmanaged_firewall_above_marker(
     text = read(path)
     before_marker, _ = split_text_by_marker(text, path)
 
-    out: list[str] = []
-    for block in split_uci_blocks(before_marker):
-        parsed = parse_uci_block(block)
-        if not parsed:
-            continue
-
-        if is_managed_firewall(cfg, router_name, parsed):
-            continue
-
-        out.append(block.rstrip())
-
-    return out
+    expected = expected_router_generation_state(cfg)[router_name]["firewall"].copy()
+    return collect_unmanaged_uci_blocks_exact(before_marker, expected)
 
 
 def collect_unmanaged_bootstrap_above_marker(
@@ -457,12 +565,10 @@ def collect_unmanaged_bootstrap_above_marker(
     path = router_path(cfg, router_name, "bootstrap")
     text = read(path)
     before_marker, _ = split_text_by_marker(text, path)
-    has_openvpn_access = any(
-        g.protocol == PROTOCOL_OPENVPN for g in cfg.access.get(router_name, [])
-    )
     return strip_managed_bootstrap(
         before_marker,
-        has_openvpn_access=has_openvpn_access,
+        cfg=cfg,
+        router_name=router_name,
     )
 
 
@@ -608,7 +714,7 @@ def print_unmanaged_report(cfg: ConfigData) -> None:
 
         print_uci_section("network_part", unmanaged_network)
         print_uci_section("firewall_part", unmanaged_firewall)
-        print_text_section("99-firstboot-custom", unmanaged_bootstrap)
+        print_text_section("bootstrap.sh", unmanaged_bootstrap)
         print_file_list_section("extra files", unmanaged_files)
 
     unmanaged_server_files = collect_unmanaged_server_files(cfg)
@@ -635,9 +741,10 @@ def sha256_text(text: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Show unmanaged parts above marker in router managed files and "
-            "show extra files by comparing real filesystem against exact "
-            "expected file set derived from config.json, sync rules and servers/example"
+            "Show unmanaged parts above marker in router managed files. "
+            "Generated UCI/bootstrap blocks are hidden only on byte-exact "
+            "match against blocks derived from config.json and existing secrets; "
+            "extra files are compared against the expected file set."
         )
     )
     ap.add_argument(

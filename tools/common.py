@@ -2639,8 +2639,12 @@ def router_wireguard_clients_dir(cfg: ConfigData, router: str, iface_name: str) 
     return router_wireguard_iface_dir(cfg, router, iface_name) / "clients"
 
 
+def server_dir_name(exit: str) -> str:
+    return exit.lower()
+
+
 def server_exit_dir(exit: str) -> Path:
-    return SERVER_ROOT / exit
+    return SERVER_ROOT / server_dir_name(exit)
 
 
 def server_path(exit: str, *parts: str) -> Path:

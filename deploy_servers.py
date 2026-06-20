@@ -11,8 +11,10 @@ from pathlib import Path
 
 try:
     from tools.cli_common import load_json_config, server_ssh_hosts, ssh_config_args
+    from tools.common import server_exit_dir
 except ImportError:
     from cli_common import load_json_config, server_ssh_hosts, ssh_config_args
+    from common import server_exit_dir
 
 try:
     from tools.default import (
@@ -21,7 +23,6 @@ try:
         CONFIG_KEY_NAME,
         REMOTE_DEPLOY_COMMAND,
         REMOTE_ROOT,
-        SERVER_ROOT,
     )
 except ImportError:
     from default import (
@@ -30,7 +31,6 @@ except ImportError:
         CONFIG_KEY_NAME,
         REMOTE_DEPLOY_COMMAND,
         REMOTE_ROOT,
-        SERVER_ROOT,
     )
 
 
@@ -329,7 +329,7 @@ def deploy_one_to_host(
     config_path: Path,
     connect_timeout: int,
 ) -> None:
-    src = SERVER_ROOT / name
+    src = server_exit_dir(name)
 
     print()
     print(f"==> Preparing {name} for {host}")
@@ -381,7 +381,7 @@ def deploy_one(
     server_ssh_mode: str,
     connect_timeout: int,
 ) -> None:
-    src = SERVER_ROOT / name
+    src = server_exit_dir(name)
 
     if not src.is_dir():
         die(f"missing server directory: {src}")

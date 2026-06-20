@@ -28,7 +28,6 @@ try:
         PRIVATE_SSH_DIR_MODE,
         REL_DROPBEAR_AUTHORIZED_KEYS,
         ROUTERS_ROOT,
-        SERVER_ROOT,
         ROUTER_KEY_PREFIX as ROUTER_PREFIX,
         SERVER_KEY_PREFIX as SERVER_PREFIX,
         SSH_KNOWN_HOSTS_FILENAME,
@@ -44,16 +43,15 @@ except ImportError:
         PRIVATE_SSH_DIR_MODE,
         REL_DROPBEAR_AUTHORIZED_KEYS,
         ROUTERS_ROOT,
-        SERVER_ROOT,
         ROUTER_KEY_PREFIX as ROUTER_PREFIX,
         SERVER_KEY_PREFIX as SERVER_PREFIX,
         SSH_KNOWN_HOSTS_FILENAME,
     )
 
 try:
-    from .common import ExitHub, build_config_data
+    from .common import ExitHub, build_config_data, server_exit_dir
 except ImportError:
-    from common import ExitHub, build_config_data
+    from common import ExitHub, build_config_data, server_exit_dir
 
 
 def ensure_dir(path: Path, mode: int | None = None) -> None:
@@ -133,7 +131,7 @@ def process_routers(cfg: dict[str, object], key_dir: Path) -> None:
 
 def process_servers(cfg: dict[str, object], key_dir: Path) -> None:
     for exit_name in iter_exit_names(cfg):
-        server_dir = SERVER_ROOT / exit_name
+        server_dir = server_exit_dir(exit_name)
         ssh_subdir = server_dir / "root" / ".ssh"
         auth_file = ssh_subdir / "authorized_keys"
         key_name = server_key_name(exit_name)
