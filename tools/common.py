@@ -387,8 +387,10 @@ except ImportError:
 PRIVATE_KEY_RE = re.compile(r"(?m)^\s*PrivateKey\s*=\s*(\S+)\s*$")
 MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 CONFIG_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
+EXIT_HUB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 FILE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 LINUX_IFACE_NAME_MAX_BYTES = 15
+EXIT_HUB_NAME_MAX_BYTES = 8
 FILE_IDENTIFIER_MAX_BYTES = 64
 
 
@@ -419,6 +421,36 @@ def require_linux_iface_name(value: str, where: str) -> None:
     )
 
 
+def require_generated_linux_iface_name(value: str, where: str) -> None:
+    # Generated names may contain fixed OpenWrt/Linux prefixes such as
+    # "ipip-".  User-controlled fragments are validated separately; here we
+    # only enforce the Linux visible interface-name byte limit and reject
+    # the characters Linux definitely cannot accept in interface names.
+    byte_len = len(value.encode("ascii"))
+    if byte_len > LINUX_IFACE_NAME_MAX_BYTES:
+        die(
+            f"{where} is too long: {value} is {byte_len} bytes, "
+            f"max {LINUX_IFACE_NAME_MAX_BYTES}"
+        )
+    if any(ch in value for ch in ("/", ":")) or any(ch.isspace() for ch in value):
+        die(f"{where} contains characters that are not valid in Linux interface names: {value}")
+
+
+def require_exit_hub_name(value: str, where: str) -> None:
+    # The generated OpenWrt IPIP section is f"ip{value}". OpenWrt then
+    # creates a Linux device named f"ipip-ip{value}", so the visible
+    # exit name itself may consume at most 8 ASCII bytes.  Keep this
+    # uppercase-only because exit_route_env_key() uppercases names for env
+    # variables, where lowercase names would otherwise collide/change.
+    require_ascii_identifier(
+        value,
+        where,
+        pattern=EXIT_HUB_IDENTIFIER_RE,
+        allowed="uppercase ASCII letters, digits and underscore, starting with a letter",
+        max_bytes=EXIT_HUB_NAME_MAX_BYTES,
+    )
+
+
 def require_file_identifier(value: str, where: str) -> None:
     require_ascii_identifier(
         value,
@@ -427,7 +459,6 @@ def require_file_identifier(value: str, where: str) -> None:
         allowed="ASCII letters, digits, underscore, dot and dash",
         max_bytes=FILE_IDENTIFIER_MAX_BYTES,
     )
-
 
 FORCED_CA_ONCE: set[str] = set()
 
@@ -1021,12 +1052,19 @@ def host_ip_in_prefix(prefix: str, host: int, cidr: int) -> str:
 def normalize_listen_ip(value: object, where: str) -> str:
     if value is None:
         return ""
-    host = str(value).strip()
+    if not isinstance(value, str):
+        die(f"{where} must be an IPv4 address string when set")
+    host = value.strip()
     if not host:
         return ""
     if ":" in host:
-        die(f"{where} must contain only IP/host without port: {host}")
+        die(f"{where} must contain only IPv4 address without port: {host}")
+    try:
+        parse_ipv4(host)
+    except ValueError:
+        die(f"{where} must be an IPv4 address when set: {host}")
     return host
+
 
 
 def load_bool(value: object, where: str, *, default: bool = False) -> bool:
@@ -2024,6 +2062,7 @@ def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
 
     routers: list[RouterDef] = []
     seen_names: set[str] = set()
+    seen_slugs: dict[str, str] = {}
     seen_subnets: set[str] = set()
 
     raw_list = raw_cfg.get(CONFIG_KEY_ROUTERS)
@@ -2050,10 +2089,18 @@ def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
 
         if name in seen_names:
             die(f"duplicate router.name: {name}")
+        slug = name.lower()
+        other_name = seen_slugs.get(slug)
+        if other_name is not None:
+            die(
+                f"duplicate router directory name after lowercase: "
+                f"{name} conflicts with {other_name}"
+            )
         if subnet in seen_subnets:
             die(f"duplicate router.subnet: {subnet}")
 
         seen_names.add(name)
+        seen_slugs[slug] = name
         seen_subnets.add(subnet)
         routers.append(RouterDef(name=name, subnet=subnet))
 
@@ -2159,6 +2206,7 @@ def load_mesh_hubs_and_access_endpoints(
     hubs: list[MeshHub] = []
     access_endpoints: dict[str, str] = {}
     seen_names: set[str] = set()
+    seen_slugs: dict[str, str] = {}
     seen_listen_ips: dict[str, str] = {}
 
     raw_list = raw_cfg.get(CONFIG_KEY_MESH_HUBS, [])
@@ -2181,7 +2229,15 @@ def load_mesh_hubs_and_access_endpoints(
 
         if name in seen_names:
             die(f"duplicate mesh_hubs name: {name}")
+        slug = name.lower()
+        other_name = seen_slugs.get(slug)
+        if other_name is not None:
+            die(
+                f"duplicate mesh_hubs name after lowercase: "
+                f"{name} conflicts with {other_name}"
+            )
         seen_names.add(name)
+        seen_slugs[slug] = name
 
         access_only = load_bool(raw.get(CONFIG_KEY_ACCESS_ONLY), f"{where}.access_only")
         listen_ip = normalize_listen_ip(
@@ -2189,7 +2245,7 @@ def load_mesh_hubs_and_access_endpoints(
             f"{where}.listen_ip",
         )
         if not listen_ip:
-            die(f"{where}.listen_ip must be a non-empty IP/host")
+            die(f"{where}.listen_ip must be a non-empty IPv4 address")
         access_endpoints[name] = listen_ip
 
         if access_only:
@@ -2224,6 +2280,7 @@ def load_mesh_hubs_and_access_endpoints(
 def load_exit_hubs(raw_cfg: dict[str, object]) -> list[ExitHub]:
     hubs: list[ExitHub] = []
     seen_names: set[str] = set()
+    seen_slugs: dict[str, str] = {}
     seen_listen_ips: dict[str, str] = {}
 
     raw_list = raw_cfg.get(CONFIG_KEY_EXIT_HUBS, [])
@@ -2237,6 +2294,7 @@ def load_exit_hubs(raw_cfg: dict[str, object]) -> list[ExitHub]:
         name = raw.get(CONFIG_KEY_NAME)
         if not isinstance(name, str) or not name:
             die("exit_hubs.name must be a non-empty string")
+        require_exit_hub_name(name, f"exit_hubs[{name}].name")
         require_linux_iface_name(
             exit_out_iface_name(name),
             f"exit_hubs[{name}].name generated exit outbound interface",
@@ -2245,12 +2303,28 @@ def load_exit_hubs(raw_cfg: dict[str, object]) -> list[ExitHub]:
             exit_in_iface_name(name),
             f"exit_hubs[{name}].name generated exit inbound interface",
         )
+        require_linux_iface_name(
+            router_exit_ipip_iface_name(name),
+            f"exit_hubs[{name}].name generated exit IPIP UCI section",
+        )
+        require_generated_linux_iface_name(
+            f"ipip-{router_exit_ipip_iface_name(name)}",
+            f"exit_hubs[{name}].name generated Linux IPIP device",
+        )
         where = f"exit_hubs[{name}]"
         require_known_keys(raw, where, EXIT_HUB_KEYS)
 
         if name in seen_names:
-            die(f"duplicate Exit hub name: {name}")
+            die(f"duplicate exit_hubs name: {name}")
+        slug = name.lower()
+        other_name = seen_slugs.get(slug)
+        if other_name is not None:
+            die(
+                f"duplicate exit_hubs directory name after lowercase: "
+                f"{name} conflicts with {other_name}"
+            )
         seen_names.add(name)
+        seen_slugs[slug] = name
 
         listen_ip = normalize_listen_ip(
             raw.get(CONFIG_KEY_LISTEN_IP),
@@ -2413,7 +2487,16 @@ def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
     router_by_name = {r.name: r for r in routers}
     router_names = [r.name for r in routers]
 
+    main_router = raw_cfg.get(CONFIG_KEY_MAIN_ROUTER)
+    if not isinstance(main_router, str) or not main_router:
+        die("config.main_router must be a non-empty router name")
+    if main_router not in router_by_name:
+        die(f"config.main_router references unknown router: {main_router}")
+
     mesh_hubs, access_endpoints = load_mesh_hubs_and_access_endpoints(raw_cfg)
+    for hub_name in access_endpoints:
+        if hub_name not in router_by_name:
+            die(f"mesh_hubs references unknown router: {hub_name}")
     mesh_hubs_by_name = {h.name: h for h in mesh_hubs}
 
     exit_hubs_raw = load_exit_hubs(raw_cfg)
