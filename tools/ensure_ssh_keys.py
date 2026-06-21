@@ -279,6 +279,9 @@ def main() -> None:
     need("ssh-keygen")
 
     cfg = load_json_config(Path(args.config))
+    # Validate the whole config before creating/updating any key files.
+    build_config_data(cfg)
+
     key_dir = deploy_ssh_dir_from_config(cfg)
     ensure_dir(key_dir, PRIVATE_SSH_DIR_MODE)
     print(f"Using local SSH key dir: {key_dir}")

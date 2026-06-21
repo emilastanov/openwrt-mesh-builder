@@ -389,10 +389,12 @@ MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 CONFIG_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
 EXIT_HUB_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 FILE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+PACKAGE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]*$")
 CANONICAL_IPV4_RE = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$")
 LINUX_IFACE_NAME_MAX_BYTES = 15
 EXIT_HUB_NAME_MAX_BYTES = 8
 FILE_IDENTIFIER_MAX_BYTES = 64
+PACKAGE_IDENTIFIER_MAX_BYTES = 128
 
 
 def require_ascii_identifier(
@@ -461,6 +463,19 @@ def require_file_identifier(value: str, where: str) -> None:
         pattern=FILE_IDENTIFIER_RE,
         allowed="ASCII letters, digits, underscore, dot and dash",
         max_bytes=FILE_IDENTIFIER_MAX_BYTES,
+    )
+
+
+def require_package_identifier(value: str, where: str) -> None:
+    require_ascii_identifier(
+        value,
+        where,
+        pattern=PACKAGE_IDENTIFIER_RE,
+        allowed=(
+            "ASCII letters, digits, underscore, dot, plus and dash, "
+            "starting with a letter, digit or underscore"
+        ),
+        max_bytes=PACKAGE_IDENTIFIER_MAX_BYTES,
     )
 
 
@@ -791,10 +806,14 @@ def validate_config_package_list(
         if router_override:
             if len(item) < 2 or item[0] not in "+-":
                 die(f"{where} entry must start with + or -: {item}")
-            if not item[1:]:
+            package = item[1:]
+            if not package:
                 die(f"{where} has empty package entry: {item}")
-        elif item[0] in "+-":
-            die(f"{where} entries must not start with + or -: {item}")
+            require_package_identifier(package, f"{where} package entry {item!r}")
+        else:
+            if item[0] in "+-":
+                die(f"{where} entries must not start with + or -: {item}")
+            require_package_identifier(item, f"{where} package entry {item!r}")
 
 
 def validate_exit_order_shape(value: object, where: str) -> None:
@@ -851,6 +870,10 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
         if not isinstance(raw_profiles, dict):
             die("config key 'device_profiles' must be an object")
         for profile_name, profile in raw_profiles.items():
+            require_file_identifier(
+                profile_name,
+                f"device_profiles[{profile_name}] profile name",
+            )
             if not isinstance(profile, dict):
                 die(f"device_profiles[{profile_name}] must be an object")
             require_known_keys(
@@ -888,6 +911,7 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
             if profile_name is not None:
                 if not isinstance(profile_name, str) or not profile_name:
                     die(f"{where}.device_profile must be a non-empty string")
+                require_file_identifier(profile_name, f"{where}.device_profile")
                 raw_profiles_for_check = raw_cfg.get(CONFIG_KEY_DEVICE_PROFILES, {})
                 if (
                     isinstance(raw_profiles_for_check, dict)
@@ -2253,6 +2277,13 @@ def load_mesh_hubs_and_access_endpoints(
         )
         if not listen_ip:
             die(f"{where}.listen_ip must be a non-empty IPv4 address")
+        other_name = seen_listen_ips.get(listen_ip)
+        if other_name is not None:
+            die(
+                f"duplicate mesh_hubs.listen_ip {listen_ip}: "
+                f"{name} conflicts with {other_name}"
+            )
+        seen_listen_ips[listen_ip] = name
         access_endpoints[name] = listen_ip
 
         if access_only:
@@ -2264,14 +2295,6 @@ def load_mesh_hubs_and_access_endpoints(
             f"{name}Out",
             f"{where}.name generated mesh outbound interface",
         )
-
-        other_name = seen_listen_ips.get(listen_ip)
-        if other_name is not None:
-            die(
-                f"duplicate mesh_hubs.listen_ip {listen_ip}: "
-                f"{name} conflicts with {other_name}"
-            )
-        seen_listen_ips[listen_ip] = name
 
         hubs.append(
             MeshHub(

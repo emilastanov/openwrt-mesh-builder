@@ -5,7 +5,11 @@ sys.dont_write_bytecode = True
 
 try:
     from .cli_common import die
-    from .common import RouterDef, load_routers as load_config_routers
+    from .common import (
+        RouterDef,
+        build_config_data,
+        load_routers as load_config_routers,
+    )
     from .default import (
         CONFIG_KEY_ACCESS_ONLY,
         CONFIG_KEY_MAIN_ROUTER,
@@ -14,7 +18,7 @@ try:
     )
 except ImportError:
     from cli_common import die
-    from common import RouterDef, load_routers as load_config_routers
+    from common import RouterDef, build_config_data, load_routers as load_config_routers
     from default import (
         CONFIG_KEY_ACCESS_ONLY,
         CONFIG_KEY_MAIN_ROUTER,
@@ -85,13 +89,11 @@ def load_mesh_hub_names(cfg: dict[str, object]) -> set[str]:
 
 
 def build_router_order(cfg: dict[str, object]) -> list[RouterDef]:
-    routers = load_routers(cfg)
-    mesh_hub_names = load_mesh_hub_names(cfg)
+    cfg_data = build_config_data(cfg)
+    routers = cfg_data.routers
+    mesh_hub_names = set(cfg_data.mesh_hubs_by_name)
     main_router_name = load_main_router_name(cfg)
-
-    routers_by_name = {r.name: r for r in routers}
-    if main_router_name not in routers_by_name:
-        die(f"main_router is not defined in routers: {main_router_name}")
+    routers_by_name = cfg_data.router_by_name
 
     leafs = [
         r
