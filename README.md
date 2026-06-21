@@ -145,7 +145,7 @@ access
   "ssh_key_dir": ".ssh",
   "secret_key": "age1...",
   "openwrt_version": "25.12.4",
-  "packages": ["babeld", "curl", "ip-full"],
+  "packages": ["htop", "tcpdump"],
 
   "device_profiles": {
     "asus_rt-ax59u": {
@@ -312,23 +312,44 @@ files/etc/openvpn/<AccessName>/clients/<User>.ovpn
 
 ### Packages
 
-Глобальные `packages` пишутся без префиксов. Per-router overrides используют `+` и `-`:
+Глобальные `packages` пишутся без префиксов и используются для дополнительных пользовательских пакетов. Обязательные runtime packages для generated-конфигов добавляются автоматически.
 
-```json
-{
-  "name": "Spine01",
-  "packages": ["+luci-proto-wireguard"]
-}
+Managed-required packages добавляются ко всем router image:
+
+```text
+luci
+babeld
+curl
+jq-full
+iperf3
+luci-app-https-dns-proxy
+luci-app-watchcat
+luci-proto-ipip
+luci-proto-amneziawg
 ```
+
+Access-specific packages добавляются только на роутеры, где есть соответствующие access-группы:
+
+```text
+wireguard access -> luci-proto-wireguard
+openvpn access   -> openvpn-openssl
+amneziawg access -> уже покрывается luci-proto-amneziawg
+```
+
+Per-router overrides используют `+` и `-`. Через `-` можно удалить пользовательский extra-пакет, но нельзя удалить managed-required package:
 
 ```json
 {
   "name": "Leaf02",
-  "packages": ["-block-mount", "-kmod-fs-vfat", "-kmod-usb-storage", "-tcpdump"]
+  "packages": [
+    "-block-mount",
+    "-kmod-fs-vfat",
+    "-kmod-usb-storage",
+    "-tcpdump",
+    "+nano"
+  ]
 }
 ```
-
-Для generated конфигов обычно нужны runtime packages для Babel, AWG/IPIP, DoH, curl и служебных проверок. Для WireGuard/OpenVPN access добавляются соответствующие пакеты на конкретные роутеры.
 
 ### Wi-Fi
 

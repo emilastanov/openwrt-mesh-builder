@@ -17,6 +17,10 @@ from tools.cli_common import (
 from tools.router_order import router_slug
 from tools.common import validate_config_known_keys
 from tools.default import (
+    CONFIG_KEY_ACCESS,
+    CONFIG_KEY_NAME,
+    CONFIG_KEY_PACKAGES,
+    CONFIG_KEY_PROTOCOL,
     CONFIG_PATH,
     IMAGES_DIR,
     INSTALL_IMAGE_TYPES,
@@ -24,6 +28,8 @@ from tools.default import (
     MIN_OPENWRT_VERSION_TEXT,
     OPENWRT_RELEASE_BASE_URL,
     ROUTER_FILES_DIRNAME,
+    ROUTER_REQUIRED_ACCESS_PACKAGES,
+    ROUTER_REQUIRED_PACKAGES,
     ROUTERS_ROOT,
     ROUTER_PACKAGES_DIRNAME,
 )
@@ -69,15 +75,25 @@ def validate_packages_list(
     return out
 
 
+def dedupe_packages(packages: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for package in packages:
+        if package in seen:
+            continue
+        result.append(package)
+        seen.add(package)
+
+    return result
+
+
 def config_packages(cfg: dict) -> list[str]:
     packages = validate_packages_list(
-        cfg.get("packages"),
+        cfg.get(CONFIG_KEY_PACKAGES),
         "config packages",
-        allow_empty=False,
+        allow_empty=True,
     )
-
-    if not packages:
-        die("missing packages list in config.json")
 
     for package in packages:
         if package[0] in "+-":
@@ -86,18 +102,52 @@ def config_packages(cfg: dict) -> list[str]:
     return packages
 
 
+def required_router_packages(cfg: dict, router_name: str) -> list[str]:
+    packages = list(ROUTER_REQUIRED_PACKAGES)
+
+    access = cfg.get(CONFIG_KEY_ACCESS, {})
+    if access is None:
+        access = {}
+    if not isinstance(access, dict):
+        die("config key 'access' must be an object")
+
+    groups = access.get(router_name, [])
+    if groups is None:
+        groups = []
+    if not isinstance(groups, list):
+        die(f"access[{router_name}] must be a list")
+
+    for idx, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            die(f"access[{router_name}][{idx}] must be an object")
+        protocol = group.get(CONFIG_KEY_PROTOCOL)
+        if not isinstance(protocol, str):
+            die(f"access[{router_name}][{idx}].protocol must be a string")
+        try:
+            packages.extend(ROUTER_REQUIRED_ACCESS_PACKAGES[protocol])
+        except KeyError:
+            die(f"access[{router_name}][{idx}].protocol: unknown protocol: {protocol}")
+
+    return dedupe_packages(packages)
+
+
 def router_packages(cfg: dict, router: dict) -> list[str]:
-    name = router.get("name", "<unknown>")
-    base = config_packages(cfg)
+    name = router.get(CONFIG_KEY_NAME, "<unknown>")
+    if not isinstance(name, str) or not name:
+        die("router name must be a non-empty string")
+
+    required = required_router_packages(cfg, name)
+    base = required + config_packages(cfg)
 
     overrides = validate_packages_list(
-        router.get("packages"),
+        router.get(CONFIG_KEY_PACKAGES),
         f"router {name}.packages",
         allow_empty=True,
     )
 
-    result = list(base)
+    result = dedupe_packages(base)
     present = set(result)
+    required_set = set(required)
 
     for entry in overrides:
         if len(entry) < 2 or entry[0] not in "+-":
@@ -114,6 +164,12 @@ def router_packages(cfg: dict, router: dict) -> list[str]:
                 result.append(package)
                 present.add(package)
             continue
+
+        if package in required_set:
+            die(
+                f"router {name}.packages tries to remove required managed "
+                f"package: {package}"
+            )
 
         if package not in present:
             die(

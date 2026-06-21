@@ -768,7 +768,7 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
         validate_config_package_list(
             raw_packages,
             "config.packages",
-            allow_empty=False,
+            allow_empty=True,
             router_override=False,
         )
 

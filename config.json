@@ -3,20 +3,11 @@
     "ssh_key_dir": "~/.ssh/router-autoinstall-demo",
     "secret_key": "~/.ssh/router-autoinstall-demo/router_secrets",
     "packages": [
-        "babeld",
         "block-mount",
-        "curl",
         "htop",
-        "iperf3",
-        "jq-full",
         "kmod-fs-vfat",
         "kmod-usb-storage",
-        "luci-app-https-dns-proxy",
-        "luci-app-watchcat",
-        "luci-proto-amneziawg",
-        "luci-proto-ipip",
         "luci-theme-material",
-        "luci",
         "tcpdump"
     ],
     "device_profiles": {
@@ -62,9 +53,6 @@
                     "02:00:00:01:00:02"
                 ]
             },
-            "packages": [
-                "+luci-proto-wireguard"
-            ],
             "allow_to_router": [
                 "all"
             ],
@@ -79,10 +67,7 @@
             "wifi_5g": {
                 "ssid": "Example-Spine02-5G",
                 "key": "Example-Spine02-5G"
-            },
-            "packages": [
-                "+openvpn-openssl"
-            ]
+            }
         },
         {
             "name": "Spine03",
@@ -91,10 +76,7 @@
             "wifi_5g": {
                 "ssid": "Example-Spine03-5G",
                 "key": "Example-Spine03-5G"
-            },
-            "packages": [
-                "+openvpn-openssl"
-            ]
+            }
         },
         {
             "name": "AccessOnly01",
@@ -107,11 +89,7 @@
             "wifi_5g": {
                 "ssid": "Example-AccessOnly01-5G",
                 "key": "Example-AccessOnly01-5G"
-            },
-            "packages": [
-                "+luci-proto-wireguard",
-                "+openvpn-openssl"
-            ]
+            }
         },
         {
             "name": "AccessOnly02",
@@ -124,11 +102,7 @@
             "wifi_5g": {
                 "ssid": "Example-AccessOnly02-5G",
                 "key": "Example-AccessOnly02-5G"
-            },
-            "packages": [
-                "+luci-proto-wireguard",
-                "+openvpn-openssl"
-            ]
+            }
         },
         {
             "name": "Leaf01",
@@ -161,7 +135,8 @@
                 "-block-mount",
                 "-kmod-fs-vfat",
                 "-kmod-usb-storage",
-                "-tcpdump"
+                "-tcpdump",
+                "+nano"
             ]
         },
         {
@@ -184,7 +159,6 @@
             "name": "Leaf04",
             "device_profile": "asus_rt-ax53u",
             "subnet": "10.101.21.0/24",
-            "packages": [],
             "allow_to_lan": [
                 "Spine01",
                 "Leaf01"

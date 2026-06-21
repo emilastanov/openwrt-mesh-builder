@@ -307,6 +307,26 @@ AWG_PACKAGE_NAMES = [
     "amneziawg-tools",
     "luci-proto-amneziawg",
 ]
+
+# OpenWrt image packages required by generated router configs and
+# router example files. User-facing config.packages is for extra packages.
+ROUTER_REQUIRED_PACKAGES = [
+    "babeld",
+    "curl",
+    "iperf3",
+    "jq-full",
+    "luci-app-https-dns-proxy",
+    "luci-app-watchcat",
+    "luci-proto-amneziawg",
+    "luci-proto-ipip",
+    "luci",
+]
+
+ROUTER_REQUIRED_ACCESS_PACKAGES = {
+    PROTOCOL_WIREGUARD: ["luci-proto-wireguard"],
+    PROTOCOL_OPENVPN: ["openvpn-openssl"],
+    PROTOCOL_AMNEZIAWG: [],
+}
 PACKAGE_EXTENSION = "apk"
 PACKAGE_REPO_INDEX_FILES = (
     "packages.adb",

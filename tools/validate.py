@@ -17,6 +17,8 @@ try:
         OPENVPN_CLIENT_PROTO,
         OPENVPN_SERVER_CN,
         OPENVPN_SERVER_PROTO,
+        ROUTER_REQUIRED_ACCESS_PACKAGES,
+        ROUTER_REQUIRED_PACKAGES,
     )
 except ImportError:
     from common import *
@@ -26,6 +28,8 @@ except ImportError:
         OPENVPN_CLIENT_PROTO,
         OPENVPN_SERVER_CN,
         OPENVPN_SERVER_PROTO,
+        ROUTER_REQUIRED_ACCESS_PACKAGES,
+        ROUTER_REQUIRED_PACKAGES,
     )
 
 
@@ -2551,6 +2555,120 @@ def validate_generated_files_exist(cfg: ConfigData) -> None:
                 die(f"missing generated Exit hub client server config: {path}")
 
 
+def dedupe_packages(packages: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for package in packages:
+        if package in seen:
+            continue
+        result.append(package)
+        seen.add(package)
+
+    return result
+
+
+def validate_raw_package_list(
+    value: object, where: str, *, router_override: bool
+) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        die(f"{where} must be a list of strings")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            die(f"{where} must be a list of non-empty strings")
+        if item in seen:
+            die(f"{where}: duplicate package entry: {item}")
+        seen.add(item)
+
+        if router_override:
+            if len(item) < 2 or item[0] not in "+-":
+                die(f"{where} entry must start with + or -: {item}")
+            if not item[1:]:
+                die(f"{where} has empty package entry: {item}")
+        elif item[0] in "+-":
+            die(f"{where} entries must not start with + or -: {item}")
+
+        out.append(item)
+
+    return out
+
+
+def required_router_packages(cfg: ConfigData, router_name: str) -> list[str]:
+    packages = list(ROUTER_REQUIRED_PACKAGES)
+
+    for group in cfg.access.get(router_name, []):
+        packages.extend(ROUTER_REQUIRED_ACCESS_PACKAGES[group.protocol])
+
+    return dedupe_packages(packages)
+
+
+def validate_router_packages(raw_cfg: dict[str, object], cfg: ConfigData) -> None:
+    global_packages = validate_raw_package_list(
+        raw_cfg.get(CONFIG_KEY_PACKAGES),
+        "config.packages",
+        router_override=False,
+    )
+
+    raw_routers = raw_cfg.get(CONFIG_KEY_ROUTERS, [])
+    if not isinstance(raw_routers, list):
+        die("config key 'routers' must be a list")
+
+    for raw_router in raw_routers:
+        if not isinstance(raw_router, dict):
+            die("each router entry must be an object")
+        router_name = raw_router.get(CONFIG_KEY_NAME)
+        if not isinstance(router_name, str) or not router_name:
+            die("router name must be a non-empty string")
+
+        required = required_router_packages(cfg, router_name)
+        required_set = set(required)
+        result = dedupe_packages(required + global_packages)
+        present = set(result)
+
+        overrides = validate_raw_package_list(
+            raw_router.get(CONFIG_KEY_PACKAGES),
+            f"routers[{router_name}].packages",
+            router_override=True,
+        )
+
+        for entry in overrides:
+            op = entry[0]
+            package = entry[1:]
+
+            if op == "+":
+                if package not in present:
+                    result.append(package)
+                    present.add(package)
+                continue
+
+            if package in required_set:
+                die(
+                    f"routers[{router_name}].packages tries to remove required "
+                    f"managed package: {package}"
+                )
+
+            if package not in present:
+                die(
+                    f"routers[{router_name}].packages tries to remove package "
+                    f"that is not currently installed: {package}"
+                )
+
+            result = [p for p in result if p != package]
+            present.remove(package)
+
+        missing = sorted(required_set - present)
+        if missing:
+            die(
+                f"router {router_name}: missing required managed package(s): "
+                + ", ".join(missing)
+            )
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -2578,7 +2696,9 @@ def main() -> None:
     VERBOSE = args.verbose
 
     raw_cfg = load_json_config(Path(args.config))
+    validate_config_known_keys(raw_cfg)
     cfg = build_config_data(raw_cfg)
+    validate_router_packages(raw_cfg, cfg)
 
     need("wg", "openssl")
 
