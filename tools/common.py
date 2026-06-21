@@ -433,7 +433,9 @@ def require_generated_linux_iface_name(value: str, where: str) -> None:
             f"max {LINUX_IFACE_NAME_MAX_BYTES}"
         )
     if any(ch in value for ch in ("/", ":")) or any(ch.isspace() for ch in value):
-        die(f"{where} contains characters that are not valid in Linux interface names: {value}")
+        die(
+            f"{where} contains characters that are not valid in Linux interface names: {value}"
+        )
 
 
 def require_exit_hub_name(value: str, where: str) -> None:
@@ -459,6 +461,7 @@ def require_file_identifier(value: str, where: str) -> None:
         allowed="ASCII letters, digits, underscore, dot and dash",
         max_bytes=FILE_IDENTIFIER_MAX_BYTES,
     )
+
 
 FORCED_CA_ONCE: set[str] = set()
 
@@ -1064,7 +1067,6 @@ def normalize_listen_ip(value: object, where: str) -> str:
     except ValueError:
         die(f"{where} must be an IPv4 address when set: {host}")
     return host
-
 
 
 def load_bool(value: object, where: str, *, default: bool = False) -> bool:
