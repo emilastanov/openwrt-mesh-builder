@@ -765,7 +765,7 @@ def main() -> None:
                     SpeedRow(
                         source_kind=source.kind,
                         source=source.name,
-                        source_ssh=used_host,
+                        source_ssh="/".join(source.ssh_hosts),
                         link_type=t.link_type,
                         peer_kind=t.peer_kind,
                         peer=t.peer_name,

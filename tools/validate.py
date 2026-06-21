@@ -89,6 +89,27 @@ def vprint(*args, **kwargs) -> None:
         print(*args, **kwargs)
 
 
+def validate_encrypted_config_secrets(
+    value: object, where: str, config_path: Path
+) -> None:
+    if isinstance(value, str):
+        if "ROUTER_SECRET_V1" in value:
+            try:
+                from .secrets import decrypt_text as decrypt_secret_text
+            except ImportError:
+                from secrets import decrypt_text as decrypt_secret_text
+            decrypt_secret_text(value, where, config_path=config_path)
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            validate_encrypted_config_secrets(item, f"{where}[{idx}]", config_path)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            validate_encrypted_config_secrets(item, f"{where}.{key}", config_path)
+        return
+
+
 # ============================================================
 # UCI / CONF PARSERS
 # ============================================================
@@ -2697,6 +2718,7 @@ def main() -> None:
 
     raw_cfg = load_json_config(Path(args.config))
     validate_config_known_keys(raw_cfg)
+    validate_encrypted_config_secrets(raw_cfg, "config", Path(args.config))
     cfg = build_config_data(raw_cfg)
     validate_router_packages(raw_cfg, cfg)
 

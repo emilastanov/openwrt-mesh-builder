@@ -300,7 +300,7 @@ MIN_OPENWRT_VERSION = (MIN_OPENWRT_MAJOR, MIN_OPENWRT_MINOR)
 MIN_OPENWRT_VERSION_TEXT = f"{MIN_OPENWRT_MAJOR}.{MIN_OPENWRT_MINOR}"
 
 OPENWRT_RELEASE_BASE_URL = "https://downloads.openwrt.org/releases"
-AWG_RELEASE_BASE_URL = "https://github.com/karen07/amneziawg-openwrt/releases/download/"
+AWG_RELEASE_BASE_URL = "https://github.com/karen07/amneziawg-openwrt/releases/download"
 
 AWG_PACKAGE_NAMES = [
     "kmod-amneziawg",

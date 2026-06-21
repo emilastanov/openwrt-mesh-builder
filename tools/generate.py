@@ -771,7 +771,7 @@ def update_bootstrap(cfg: ConfigData, router_name: str) -> None:
 
     m = re.search(r"(?ms)^customization\(\)\s*\{\n(?P<body>.*?)^\}[ \t]*$", text)
     if not m:
-        return
+        die(f"{path}: customization() block not found or malformed")
 
     body = m.group("body")
     body = update_subnet_hostname_block(body, router)
