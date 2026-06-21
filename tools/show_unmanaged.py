@@ -58,12 +58,14 @@ def expected_router_generated_exact_paths(
         router_path(cfg, router_name, "firewall").relative_to(root),
         router_path(cfg, router_name, "bootstrap").relative_to(root),
         router_path(cfg, router_name, "babeld").relative_to(root),
-        router_path(cfg, router_name, "openvpn_uci").relative_to(root),
         REL_DROPBEAR_AUTHORIZED_KEYS,
         REL_DIRECT_STATIC_IPSET,
         REL_RUNTIME_ENV,
         REL_DIRECT_IPSET,
     }
+
+    if any(g.protocol == PROTOCOL_OPENVPN for g in cfg.access.get(router_name, [])):
+        expected.add(router_path(cfg, router_name, "openvpn_uci").relative_to(root))
 
     for group in cfg.access.get(router_name, []):
         if group.protocol == PROTOCOL_OPENVPN:

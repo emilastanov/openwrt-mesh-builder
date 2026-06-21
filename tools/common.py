@@ -88,7 +88,6 @@ try:
         CONFIG_KEY_KEY,
         CONFIG_KEY_BLOCKED_MACS,
         CONFIG_KEY_LISTEN_IP,
-        CONFIG_KEY_NODE_IP,
         CONFIG_KEY_MAIN_ROUTER,
         CONFIG_KEY_MESH_HUBS,
         CONFIG_KEY_NAME,
@@ -272,7 +271,6 @@ except ImportError:
         CONFIG_KEY_KEY,
         CONFIG_KEY_BLOCKED_MACS,
         CONFIG_KEY_LISTEN_IP,
-        CONFIG_KEY_NODE_IP,
         CONFIG_KEY_MAIN_ROUTER,
         CONFIG_KEY_MESH_HUBS,
         CONFIG_KEY_NAME,
@@ -388,6 +386,48 @@ except ImportError:
 
 PRIVATE_KEY_RE = re.compile(r"(?m)^\s*PrivateKey\s*=\s*(\S+)\s*$")
 MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+CONFIG_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
+FILE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+LINUX_IFACE_NAME_MAX_BYTES = 15
+FILE_IDENTIFIER_MAX_BYTES = 64
+
+
+def require_ascii_identifier(
+    value: str,
+    where: str,
+    *,
+    pattern: re.Pattern[str],
+    allowed: str,
+    max_bytes: int,
+) -> None:
+    if not pattern.fullmatch(value):
+        die(f"{where} must contain only {allowed}: {value}")
+    byte_len = len(value.encode("ascii"))
+    if byte_len > max_bytes:
+        die(f"{where} is too long: {value} is {byte_len} bytes, max {max_bytes}")
+
+
+def require_linux_iface_name(value: str, where: str) -> None:
+    # Linux IFNAMSIZ is 16 bytes including the trailing NUL, so the
+    # visible interface name is limited to 15 ASCII bytes.
+    require_ascii_identifier(
+        value,
+        where,
+        pattern=CONFIG_IDENTIFIER_RE,
+        allowed="ASCII letters, digits and underscore",
+        max_bytes=LINUX_IFACE_NAME_MAX_BYTES,
+    )
+
+
+def require_file_identifier(value: str, where: str) -> None:
+    require_ascii_identifier(
+        value,
+        where,
+        pattern=FILE_IDENTIFIER_RE,
+        allowed="ASCII letters, digits, underscore, dot and dash",
+        max_bytes=FILE_IDENTIFIER_MAX_BYTES,
+    )
+
 
 FORCED_CA_ONCE: set[str] = set()
 
@@ -986,21 +1026,6 @@ def normalize_listen_ip(value: object, where: str) -> str:
         return ""
     if ":" in host:
         die(f"{where} must contain only IP/host without port: {host}")
-    return host
-
-
-def normalize_node_ip(value: object, where: str) -> str:
-    if value is None:
-        return ""
-    host = str(value).strip()
-    if not host:
-        return ""
-    if ":" in host or "/" in host:
-        die(f"{where} must contain only IPv4 address without port/prefix: {host}")
-    try:
-        parse_ipv4(host)
-    except ValueError:
-        die(f"{where} must be an IPv4 address: {host}")
     return host
 
 
@@ -2013,6 +2038,10 @@ def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
 
         if not isinstance(name, str) or not name:
             die("router.name must be a non-empty string")
+        require_linux_iface_name(
+            mesh_server_iface_name_for_target(name),
+            f"routers[{idx}].name generated mesh inbound interface",
+        )
 
         subnet_prefix = normalize_ipv4_subnet_24_prefix(
             raw.get(CONFIG_KEY_SUBNET), f"routers[{idx}].subnet"
@@ -2143,6 +2172,10 @@ def load_mesh_hubs_and_access_endpoints(
         name = raw.get(CONFIG_KEY_NAME)
         if not isinstance(name, str) or not name:
             die("mesh_hubs.name must be a non-empty string")
+        require_linux_iface_name(
+            mesh_server_iface_name_for_target(name),
+            f"mesh_hubs[{name}].name generated mesh inbound interface",
+        )
         where = f"mesh_hubs[{name}]"
         require_known_keys(raw, where, MESH_HUB_KEYS)
 
@@ -2163,6 +2196,11 @@ def load_mesh_hubs_and_access_endpoints(
             # Access-only entries provide public endpoints for access services,
             # but they are not real mesh hubs and do not consume infra AWG ports.
             continue
+
+        require_linux_iface_name(
+            f"{name}Out",
+            f"{where}.name generated mesh outbound interface",
+        )
 
         other_name = seen_listen_ips.get(listen_ip)
         if other_name is not None:
@@ -2199,6 +2237,14 @@ def load_exit_hubs(raw_cfg: dict[str, object]) -> list[ExitHub]:
         name = raw.get(CONFIG_KEY_NAME)
         if not isinstance(name, str) or not name:
             die("exit_hubs.name must be a non-empty string")
+        require_linux_iface_name(
+            exit_out_iface_name(name),
+            f"exit_hubs[{name}].name generated exit outbound interface",
+        )
+        require_linux_iface_name(
+            exit_in_iface_name(name),
+            f"exit_hubs[{name}].name generated exit inbound interface",
+        )
         where = f"exit_hubs[{name}]"
         require_known_keys(raw, where, EXIT_HUB_KEYS)
 
@@ -2457,6 +2503,7 @@ def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
             where = f"access[{router_name}][{idx}]"
             if not isinstance(iface_name, str) or not iface_name:
                 die(f"{where}.name must be a non-empty string")
+            require_linux_iface_name(iface_name, f"{where}.name")
             if iface_name in seen_access_names:
                 die(f"duplicate access name on {router_name}: {iface_name}")
             seen_access_names.add(iface_name)
@@ -2491,6 +2538,7 @@ def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
                     die(
                         f"access[{router_name}][{idx}].users must contain non-empty strings"
                     )
+                require_file_identifier(user, f"access[{router_name}][{idx}].users")
                 if user in seen_users:
                     die(f"duplicate access user on {router_name}/{iface_name}: {user}")
                 seen_users.add(user)
