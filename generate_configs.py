@@ -17,14 +17,12 @@ from tools.cli_common import (
     run_checked,
     run_no_capture,
 )
-from tools.router_order import RouterDef, load_routers
-from tools.common import build_config_data, validate_config_known_keys
+from tools.common import ConfigData, DeviceProfile, RouterDef, build_config_data
 from tools.default import (
     CONFIG_PATH,
     AWG_PACKAGE_NAMES,
     AWG_RELEASE_BASE_URL,
     LOCAL_TEMP_ROOT,
-    MIN_OPENWRT_VERSION,
     MIN_OPENWRT_VERSION_TEXT,
     PACKAGE_EXTENSION,
     PACKAGE_REPO_INDEX_FILES,
@@ -71,84 +69,20 @@ def ensure_apk_tool() -> None:
         die("missing apk tool. On Arch Linux install it with: sudo pacman -S apk-tools")
 
 
-def validate_openwrt_version(version: object) -> str:
-    if not isinstance(version, str) or not version:
-        die("config openwrt_version must be a non-empty string")
-
-    parts = version.split(".")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
-    except ValueError:
-        die(f"OpenWrt version must be numeric and >= {MIN_OPENWRT_VERSION_TEXT}")
-
-    if (major, minor) < MIN_OPENWRT_VERSION:
-        die(
-            f"OpenWrt version must be >= {MIN_OPENWRT_VERSION_TEXT} for AWG2/apk-only builds"
-        )
-
-    return version
+def router_device_profile(cfg: ConfigData, router: RouterDef) -> DeviceProfile:
+    return cfg.device_profiles[router.device_profile]
 
 
-def router_device_profile(
-    cfg: dict[str, object],
-    router: RouterDef,
-) -> dict[str, object]:
-    raw_routers = cfg.get("routers")
-    if not isinstance(raw_routers, list):
-        die("config key 'routers' must be a list")
-
-    profile_name = None
-
-    for item in raw_routers:
-        if not isinstance(item, dict):
-            continue
-        if item.get("name") == router.name:
-            profile_name = item.get("device_profile")
-            break
-
-    if not isinstance(profile_name, str) or not profile_name:
-        die(f"router {router.name} has no device_profile")
-
-    raw_profiles = cfg.get("device_profiles")
-    if not isinstance(raw_profiles, dict):
-        die("config key 'device_profiles' must be an object")
-
-    profile = raw_profiles.get(profile_name)
-    if not isinstance(profile, dict):
-        die(f"unknown device_profile for {router.name}: {profile_name}")
-
-    return profile
+def profile_arch(profile: DeviceProfile) -> str:
+    return profile.arch
 
 
-def profile_arch(profile: dict[str, object]) -> str:
-    arch = profile.get("arch")
-
-    if not isinstance(arch, str) or not arch:
-        die("device_profile.arch must be a non-empty string")
-
-    return arch
+def profile_board_arch(profile: DeviceProfile) -> tuple[str, str, str, str]:
+    return profile.board, profile.arch, profile.target, profile.subtarget
 
 
-def package_source_dir_from_profile(
-    cfg: dict[str, object],
-    profile: dict[str, object],
-) -> Path:
-    version = validate_openwrt_version(cfg.get("openwrt_version"))
-    board = profile.get("board")
-    arch = profile.get("arch")
-
-    if not isinstance(board, str) or not board or "/" not in board:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    if not isinstance(arch, str) or not arch:
-        die("device_profile.arch must be a non-empty string")
-
-    target, subtarget = board.split("/", 1)
-    if not target or not subtarget:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    return PACKAGE_SOURCE_ROOT / version / board / arch
+def package_source_dir_from_profile(version: str, profile: DeviceProfile) -> Path:
+    return PACKAGE_SOURCE_ROOT / version / profile.board / profile.arch
 
 
 def remove_package_indexes(package_dir: Path) -> None:
@@ -180,24 +114,12 @@ def download_binary(url: str, dst: Path) -> bool:
 
 
 def ensure_named_awg_packages_for_profile(
-    cfg: dict[str, object],
-    profile: dict[str, object],
+    version: str,
+    profile: DeviceProfile,
 ) -> None:
-    version = validate_openwrt_version(cfg.get("openwrt_version"))
-    board = profile.get("board")
-    arch = profile.get("arch")
+    board, arch, target, subtarget = profile_board_arch(profile)
 
-    if not isinstance(board, str) or not board or "/" not in board:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    if not isinstance(arch, str) or not arch:
-        die("device_profile.arch must be a non-empty string")
-
-    target, subtarget = board.split("/", 1)
-    if not target or not subtarget:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    dst_dir = package_source_dir_from_profile(cfg, profile)
+    dst_dir = package_source_dir_from_profile(version, profile)
     dst_dir.mkdir(parents=True, exist_ok=True)
     remove_package_indexes(dst_dir)
 
@@ -224,24 +146,23 @@ def ensure_named_awg_packages_for_profile(
         print(f"Downloaded: {simple_dst}")
 
 
-def ensure_awg_packages(cfg: dict[str, object], routers: list[RouterDef]) -> None:
+def ensure_awg_packages(
+    cfg: ConfigData,
+    routers: list[RouterDef],
+    version: str,
+) -> None:
     seen: set[tuple[str, str]] = set()
 
     for router in routers:
         profile = router_device_profile(cfg, router)
 
-        board = profile.get("board")
-        arch = profile.get("arch")
-
-        if not isinstance(board, str) or not isinstance(arch, str):
-            die(f"router {router.name} has invalid device_profile")
-
+        board, arch, _target, _subtarget = profile_board_arch(profile)
         key = (board, arch)
         if key in seen:
             continue
 
         seen.add(key)
-        ensure_named_awg_packages_for_profile(cfg, profile)
+        ensure_named_awg_packages_for_profile(version, profile)
 
 
 def parse_adbdump_packages(text: str) -> list[ApkMeta]:
@@ -383,9 +304,13 @@ def copy_apk_repo_with_canonical_names(
     remove_package_indexes(dst_dir)
 
 
-def sync_router_packages(cfg: dict[str, object], router: RouterDef) -> None:
+def sync_router_packages(
+    cfg: ConfigData,
+    router: RouterDef,
+    version: str,
+) -> None:
     profile = router_device_profile(cfg, router)
-    src_dir = package_source_dir_from_profile(cfg, profile)
+    src_dir = package_source_dir_from_profile(version, profile)
     dst_dir = router.path / ROUTER_PACKAGES_DIRNAME
     arch = profile_arch(profile)
 
@@ -451,9 +376,8 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_json_config(Path(args.config))
-    validate_config_known_keys(cfg)
-    build_config_data(cfg)
-    routers = load_routers(cfg)
+    cfg_data = build_config_data(cfg)
+    routers = cfg_data.routers
     ensure_example_router_dir()
 
     if not routers:
@@ -465,11 +389,11 @@ def main() -> None:
         ensure_router_from_example(EXAMPLE_ROUTER_DIR, router)
 
     if not args.skip_awg_download:
-        ensure_awg_packages(cfg, routers)
+        ensure_awg_packages(cfg_data, routers, cfg_data.openwrt_version)
 
     if not args.skip_package_sync:
         for router in routers:
-            sync_router_packages(cfg, router)
+            sync_router_packages(cfg_data, router, cfg_data.openwrt_version)
 
     for router in routers:
         sync_router(EXAMPLE_ROUTER_DIR, router)

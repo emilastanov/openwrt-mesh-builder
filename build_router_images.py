@@ -14,17 +14,17 @@ from tools.cli_common import (
     run_checked,
     run_no_capture,
 )
-from tools.router_order import router_slug
-from tools.common import build_config_data
+from tools.common import (
+    ConfigData,
+    DeviceProfile,
+    RouterDef,
+    build_config_data,
+    normalize_openwrt_version,
+)
 from tools.default import (
-    CONFIG_KEY_ACCESS,
-    CONFIG_KEY_NAME,
-    CONFIG_KEY_PACKAGES,
-    CONFIG_KEY_PROTOCOL,
     CONFIG_PATH,
     IMAGES_DIR,
     INSTALL_IMAGE_TYPES,
-    MIN_OPENWRT_VERSION,
     MIN_OPENWRT_VERSION_TEXT,
     OPENWRT_RELEASE_BASE_URL,
     ROUTER_FILES_DIRNAME,
@@ -43,36 +43,8 @@ def out(args: list[str], cwd: Path | None = None) -> str:
     return run_checked(args, cwd=cwd).strip()
 
 
-def load_config(config_path: Path) -> dict[str, object]:
-    cfg = load_json_config(config_path)
-    build_config_data(cfg)
-    return cfg
-
-
-def validate_packages_list(
-    value: object, where: str, *, allow_empty: bool
-) -> list[str]:
-    if value is None:
-        return []
-
-    if not isinstance(value, list):
-        die(f"{where} must be a list of strings")
-
-    if not value and not allow_empty:
-        die(f"{where} must be a non-empty list of strings")
-
-    out: list[str] = []
-    seen: set[str] = set()
-
-    for item in value:
-        if not isinstance(item, str) or not item:
-            die(f"{where} must be a list of non-empty strings")
-        if item in seen:
-            die(f"{where}: duplicate package entry: {item}")
-        seen.add(item)
-        out.append(item)
-
-    return out
+def load_config(config_path: Path) -> ConfigData:
+    return build_config_data(load_json_config(config_path))
 
 
 def dedupe_packages(packages: list[str]) -> list[str]:
@@ -88,76 +60,26 @@ def dedupe_packages(packages: list[str]) -> list[str]:
     return result
 
 
-def config_packages(cfg: dict) -> list[str]:
-    packages = validate_packages_list(
-        cfg.get(CONFIG_KEY_PACKAGES),
-        "config packages",
-        allow_empty=True,
-    )
-
-    for package in packages:
-        if package[0] in "+-":
-            die(f"global packages must not start with + or -: {package}")
-
-    return packages
-
-
-def required_router_packages(cfg: dict, router_name: str) -> list[str]:
+def required_router_packages(cfg: ConfigData, router_name: str) -> list[str]:
     packages = list(ROUTER_REQUIRED_PACKAGES)
 
-    access = cfg.get(CONFIG_KEY_ACCESS, {})
-    if access is None:
-        access = {}
-    if not isinstance(access, dict):
-        die("config key 'access' must be an object")
-
-    groups = access.get(router_name, [])
-    if groups is None:
-        groups = []
-    if not isinstance(groups, list):
-        die(f"access[{router_name}] must be a list")
-
-    for idx, group in enumerate(groups, start=1):
-        if not isinstance(group, dict):
-            die(f"access[{router_name}][{idx}] must be an object")
-        protocol = group.get(CONFIG_KEY_PROTOCOL)
-        if not isinstance(protocol, str):
-            die(f"access[{router_name}][{idx}].protocol must be a string")
-        try:
-            packages.extend(ROUTER_REQUIRED_ACCESS_PACKAGES[protocol])
-        except KeyError:
-            die(f"access[{router_name}][{idx}].protocol: unknown protocol: {protocol}")
+    for group in cfg.access.get(router_name, []):
+        packages.extend(ROUTER_REQUIRED_ACCESS_PACKAGES[group.protocol])
 
     return dedupe_packages(packages)
 
 
-def router_packages(cfg: dict, router: dict) -> list[str]:
-    name = router.get(CONFIG_KEY_NAME, "<unknown>")
-    if not isinstance(name, str) or not name:
-        die("router name must be a non-empty string")
-
-    required = required_router_packages(cfg, name)
-    base = required + config_packages(cfg)
-
-    overrides = validate_packages_list(
-        router.get(CONFIG_KEY_PACKAGES),
-        f"router {name}.packages",
-        allow_empty=True,
-    )
+def router_packages(cfg: ConfigData, router: RouterDef) -> list[str]:
+    required = required_router_packages(cfg, router.name)
+    base = required + cfg.packages
 
     result = dedupe_packages(base)
     present = set(result)
     required_set = set(required)
 
-    for entry in overrides:
-        if len(entry) < 2 or entry[0] not in "+-":
-            die(f"router {name}.packages entry must start with + or -: {entry}")
-
+    for entry in router.package_overrides:
         op = entry[0]
         package = entry[1:]
-
-        if not package:
-            die(f"router {name}.packages has empty package entry: {entry}")
 
         if op == "+":
             if package not in present:
@@ -167,13 +89,13 @@ def router_packages(cfg: dict, router: dict) -> list[str]:
 
         if package in required_set:
             die(
-                f"router {name}.packages tries to remove required managed "
+                f"router {router.name}.packages tries to remove required managed "
                 f"package: {package}"
             )
 
         if package not in present:
             die(
-                f"router {name}.packages tries to remove package "
+                f"router {router.name}.packages tries to remove package "
                 f"that is not currently installed: {package}"
             )
 
@@ -183,23 +105,10 @@ def router_packages(cfg: dict, router: dict) -> list[str]:
     return result
 
 
-def config_version(cfg: dict, override: str | None) -> str:
-    version = override or cfg.get("openwrt_version")
-
-    if not isinstance(version, str) or not version:
-        die("config openwrt_version must be a non-empty string")
-
-    parts = version.split(".")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
-    except ValueError:
-        die(f"OpenWrt version must be numeric and >= {MIN_OPENWRT_VERSION_TEXT}")
-
-    if (major, minor) < MIN_OPENWRT_VERSION:
-        die(f"OpenWrt version must be >= {MIN_OPENWRT_VERSION_TEXT}")
-
-    return version
+def config_version(cfg_data: ConfigData, override: str | None) -> str:
+    if override is None:
+        return cfg_data.openwrt_version
+    return normalize_openwrt_version(override, "--version")
 
 
 def git_short() -> str:
@@ -209,55 +118,16 @@ def git_short() -> str:
         return "unknown"
 
 
-def find_router(cfg: dict, name: str) -> dict:
-    routers = cfg.get("routers")
-    if not isinstance(routers, list):
-        die("config key 'routers' must be a list")
-
-    for router in routers:
-        if isinstance(router, dict) and router.get("name", "").lower() == name.lower():
+def find_router(cfg: ConfigData, name: str) -> RouterDef:
+    for router in cfg.routers:
+        if router.name.lower() == name.lower():
             return router
 
     die(f"unknown router: {name}")
 
 
-def router_profile(cfg: dict, router: dict) -> tuple[str, dict]:
-    name = router.get("name")
-    profile_name = router.get("device_profile")
-
-    if not isinstance(name, str) or not name:
-        die("router.name must be a non-empty string")
-
-    if not isinstance(profile_name, str) or not profile_name:
-        die(f"router {name} has no device_profile")
-
-    profiles = cfg.get("device_profiles")
-    if not isinstance(profiles, dict):
-        die("config key 'device_profiles' must be an object")
-
-    profile = profiles.get(profile_name)
-    if not isinstance(profile, dict):
-        die(f"unknown device_profile for {name}: {profile_name}")
-
-    return profile_name, profile
-
-
-def board_arch_from_profile(profile: dict) -> tuple[str, str, str, str]:
-    board = profile.get("board")
-    arch = profile.get("arch")
-
-    if not isinstance(board, str) or not board or "/" not in board:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    if not isinstance(arch, str) or not arch:
-        die("device_profile.arch must be a non-empty string")
-
-    vendor_tmp, device_tmp = board.split("/", 1)
-
-    if not vendor_tmp or not device_tmp:
-        die("device_profile.board must be like 'target/subtarget'")
-
-    return board, arch, vendor_tmp, device_tmp
+def router_profile(cfg: ConfigData, router: RouterDef) -> DeviceProfile:
+    return cfg.device_profiles[router.device_profile]
 
 
 def normalize_install_image_type(raw_type: str) -> str | None:
@@ -309,12 +179,14 @@ def collect_router_install_images(
     return images
 
 
-def build_router(cfg: dict, router: dict, version: str, config_path: Path) -> None:
-    name = router.get("name")
-    if not isinstance(name, str) or not name:
-        die("router.name must be a non-empty string")
-
-    slug = router_slug(name)
+def build_router(
+    cfg: ConfigData,
+    router: RouterDef,
+    version: str,
+    config_path: Path,
+) -> None:
+    name = router.name
+    slug = router.slug
     router_dir = ROUTERS_ROOT / slug
 
     if not router_dir.is_dir():
@@ -329,9 +201,12 @@ def build_router(cfg: dict, router: dict, version: str, config_path: Path) -> No
     if not packages_dir.is_dir():
         die(f"missing directory: {packages_dir}. Run ./generate_configs.py first")
 
-    profile_name, profile = router_profile(cfg, router)
-    router_tmp = profile_name
-    board, arch, vendor_tmp, device_tmp = board_arch_from_profile(profile)
+    profile = router_profile(cfg, router)
+    router_tmp = profile.name
+    board = profile.board
+    arch = profile.arch
+    vendor_tmp = profile.target
+    device_tmp = profile.subtarget
 
     base_url = f"{OPENWRT_RELEASE_BASE_URL}/{version}"
     file_name_tmp = (
@@ -344,7 +219,7 @@ def build_router(cfg: dict, router: dict, version: str, config_path: Path) -> No
     dl_local = Path(dl_file)
 
     print()
-    print(f"=== {name} / {profile_name} ===")
+    print(f"=== {name} / {router_tmp} ===")
     print(f"Board: {board}")
     print(f"Arch: {arch}")
     print(f"Packages: {packages_dir}")
@@ -460,21 +335,16 @@ def main() -> None:
     args = parser.parse_args()
 
     config_path = Path(args.config)
-    cfg = load_config(config_path)
-    version = config_version(cfg, args.version)
+    cfg_data = load_config(config_path)
+    version = config_version(cfg_data, args.version)
 
-    routers = cfg.get("routers")
-    if not isinstance(routers, list):
-        die("config key 'routers' must be a list")
-
+    routers = cfg_data.routers
     router_names = parse_csv_names(args.routers)
     if router_names:
-        routers = [find_router(cfg, name) for name in router_names]
+        routers = [find_router(cfg_data, name) for name in router_names]
 
     for router in routers:
-        if not isinstance(router, dict):
-            die("each router entry must be an object")
-        build_router(cfg, router, version, config_path)
+        build_router(cfg_data, router, version, config_path)
 
 
 if __name__ == "__main__":

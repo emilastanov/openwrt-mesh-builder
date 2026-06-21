@@ -7,7 +7,11 @@ import re
 import shutil
 import urllib.request
 from pathlib import Path
-from common import *
+
+try:
+    from .common import *
+except ImportError:
+    from common import *
 
 
 def mtu_uci_options() -> dict[str, str]:

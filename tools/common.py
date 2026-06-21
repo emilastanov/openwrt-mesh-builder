@@ -21,6 +21,8 @@ try:
     from .default import (
         ACCESS_HOST_START,
         LOCAL_TEMP_ROOT,
+        MIN_OPENWRT_VERSION,
+        MIN_OPENWRT_VERSION_TEXT,
         ANON_LINK_ALIAS_HEX_LEN,
         ACCESS_SERVER_HOST,
         ACCESS_SUBNET_CIDR,
@@ -172,6 +174,8 @@ try:
         STABLE_SEED_U64_DIGEST_SIZE,
         ROUTER_HOSTNAME_PREFIX,
         ROUTER_SSH_PREFIX,
+        ROUTER_REQUIRED_ACCESS_PACKAGES,
+        ROUTER_REQUIRED_PACKAGES,
         ROUTERS_ROOT,
         RUNTIME_DIRECT_OUT_NAME,
         RUNTIME_DIRECT_STATIC_NAME,
@@ -204,6 +208,8 @@ except ImportError:
     from default import (
         ACCESS_HOST_START,
         LOCAL_TEMP_ROOT,
+        MIN_OPENWRT_VERSION,
+        MIN_OPENWRT_VERSION_TEXT,
         ANON_LINK_ALIAS_HEX_LEN,
         ACCESS_SERVER_HOST,
         ACCESS_SUBNET_CIDR,
@@ -355,6 +361,8 @@ except ImportError:
         STABLE_SEED_U64_DIGEST_SIZE,
         ROUTER_HOSTNAME_PREFIX,
         ROUTER_SSH_PREFIX,
+        ROUTER_REQUIRED_ACCESS_PACKAGES,
+        ROUTER_REQUIRED_PACKAGES,
         ROUTERS_ROOT,
         RUNTIME_DIRECT_OUT_NAME,
         RUNTIME_DIRECT_STATIC_NAME,
@@ -395,6 +403,7 @@ LINUX_IFACE_NAME_MAX_BYTES = 15
 EXIT_HUB_NAME_MAX_BYTES = 8
 FILE_IDENTIFIER_MAX_BYTES = 64
 PACKAGE_IDENTIFIER_MAX_BYTES = 128
+ARCH_IDENTIFIER_MAX_BYTES = 64
 
 
 def require_ascii_identifier(
@@ -466,6 +475,12 @@ def require_file_identifier(value: str, where: str) -> None:
     )
 
 
+def require_file_path_segment(value: str, where: str) -> None:
+    require_file_identifier(value, where)
+    if value in (".", ".."):
+        die(f"{where} must not be '.' or '..'")
+
+
 def require_package_identifier(value: str, where: str) -> None:
     require_ascii_identifier(
         value,
@@ -479,15 +494,60 @@ def require_package_identifier(value: str, where: str) -> None:
     )
 
 
+def require_device_profile_board(value: object, where: str) -> None:
+    if not isinstance(value, str) or not value:
+        die(f"{where} must be like 'target/subtarget'")
+
+    parts = value.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        die(f"{where} must be like 'target/subtarget'")
+
+    target, subtarget = parts
+    require_file_path_segment(target, f"{where} target")
+    require_file_path_segment(subtarget, f"{where} subtarget")
+
+
+def require_arch_path_segment(value: str, where: str) -> None:
+    require_ascii_identifier(
+        value,
+        where,
+        pattern=PACKAGE_IDENTIFIER_RE,
+        allowed=(
+            "ASCII letters, digits, underscore, dot, plus and dash, "
+            "starting with a letter, digit or underscore"
+        ),
+        max_bytes=ARCH_IDENTIFIER_MAX_BYTES,
+    )
+    if value in (".", ".."):
+        die(f"{where} must not be '.' or '..'")
+
+
+def require_device_profile_arch(value: object, where: str) -> None:
+    if not isinstance(value, str) or not value:
+        die(f"{where} must be a non-empty string")
+    require_arch_path_segment(value, where)
+
+
 FORCED_CA_ONCE: set[str] = set()
 
 MARKER = FIREWALL_MARKER
 
 
 @dataclass(frozen=True)
+class DeviceProfile:
+    name: str
+    board: str
+    arch: str
+    target: str
+    subtarget: str
+
+
+@dataclass(frozen=True)
 class RouterDef:
     name: str
     subnet: str
+    device_profile: str
+    package_overrides: tuple[str, ...] = ()
 
     @property
     def slug(self) -> str:
@@ -674,6 +734,10 @@ class ConfigData:
     routers: list[RouterDef]
     router_by_name: dict[str, RouterDef]
     router_names: list[str]
+    openwrt_version: str
+    main_router: str
+    packages: list[str]
+    device_profiles: dict[str, DeviceProfile]
     mesh_hubs: list[MeshHub]
     mesh_hubs_by_name: dict[str, MeshHub]
     access_endpoints: dict[str, str]
@@ -685,6 +749,74 @@ class ConfigData:
     access: dict[str, list[AccessGroup]]
     firewall_allows: list[FirewallAllow]
     wifi: dict[str, dict[str, WifiConfig]]
+
+
+def dedupe_package_names(packages: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for package in packages:
+        if package in seen:
+            continue
+        result.append(package)
+        seen.add(package)
+
+    return result
+
+
+def required_managed_router_packages(
+    access_groups: list[AccessGroup],
+) -> list[str]:
+    packages = list(ROUTER_REQUIRED_PACKAGES)
+
+    for group in access_groups:
+        packages.extend(ROUTER_REQUIRED_ACCESS_PACKAGES[group.protocol])
+
+    return dedupe_package_names(packages)
+
+
+def validate_router_package_policy(
+    routers: list[RouterDef],
+    global_packages: list[str],
+    access: dict[str, list[AccessGroup]],
+) -> None:
+    for router in routers:
+        required = required_managed_router_packages(access.get(router.name, []))
+        required_set = set(required)
+        result = dedupe_package_names(required + global_packages)
+        present = set(result)
+
+        for entry in router.package_overrides:
+            op = entry[0]
+            package = entry[1:]
+
+            if op == "+":
+                if package not in present:
+                    result.append(package)
+                    present.add(package)
+                continue
+
+            if package in required_set:
+                die(
+                    f"routers[{router.name}].packages tries to remove required "
+                    f"managed package: {package}"
+                )
+
+            if package not in present:
+                die(
+                    f"routers[{router.name}].packages tries to remove package "
+                    f"that is not currently installed: {package}"
+                )
+
+            result = [item for item in result if item != package]
+            present.remove(package)
+
+        missing = sorted(required_set - present)
+        if missing:
+            die(
+                f"router {router.name}: missing required managed package(s): "
+                + ", ".join(missing)
+            )
 
 
 CONFIG_KEYS = {
@@ -783,18 +915,19 @@ def require_known_keys(raw: dict[str, object], where: str, allowed: set[str]) ->
         die(f"{where}: unknown config key(s): {', '.join(unknown)}")
 
 
-def validate_config_package_list(
+def normalize_config_package_list(
     value: object,
     where: str,
     *,
     allow_empty: bool,
     router_override: bool,
-) -> None:
+) -> list[str]:
     if not isinstance(value, list):
         die(f"{where} must be a list of strings")
     if not value and not allow_empty:
         die(f"{where} must be a non-empty list of strings")
 
+    result: list[str] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, str) or not item:
@@ -814,6 +947,42 @@ def validate_config_package_list(
             if item[0] in "+-":
                 die(f"{where} entries must not start with + or -: {item}")
             require_package_identifier(item, f"{where} package entry {item!r}")
+
+        result.append(item)
+
+    return result
+
+
+def validate_config_package_list(
+    value: object,
+    where: str,
+    *,
+    allow_empty: bool,
+    router_override: bool,
+) -> None:
+    normalize_config_package_list(
+        value,
+        where,
+        allow_empty=allow_empty,
+        router_override=router_override,
+    )
+
+
+def normalize_openwrt_version(value: object, where: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        die(f"{where} must be a non-empty string")
+
+    version = value.strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        die(f"{where} must be numeric and >= {MIN_OPENWRT_VERSION_TEXT}: " f"{version}")
+
+    parts = version.split(".")
+    major = int(parts[0])
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    if (major, minor) < MIN_OPENWRT_VERSION:
+        die(f"{where} must be >= {MIN_OPENWRT_VERSION_TEXT}")
+
+    return version
 
 
 def validate_exit_order_shape(value: object, where: str) -> None:
@@ -856,6 +1025,11 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
         if not isinstance(raw_secret_key, str) or not raw_secret_key.strip():
             die(f"config.{CONFIG_KEY_SECRET_KEY} must be a non-empty string")
 
+    normalize_openwrt_version(
+        raw_cfg.get(CONFIG_KEY_OPENWRT_VERSION),
+        "config.openwrt_version",
+    )
+
     raw_packages = raw_cfg.get(CONFIG_KEY_PACKAGES)
     if raw_packages is not None:
         validate_config_package_list(
@@ -876,11 +1050,12 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
             )
             if not isinstance(profile, dict):
                 die(f"device_profiles[{profile_name}] must be an object")
-            require_known_keys(
-                profile,
-                f"device_profiles[{profile_name}]",
-                DEVICE_PROFILE_KEYS,
+            where = f"device_profiles[{profile_name}]"
+            require_known_keys(profile, where, DEVICE_PROFILE_KEYS)
+            require_device_profile_board(
+                profile.get(CONFIG_KEY_BOARD), f"{where}.board"
             )
+            require_device_profile_arch(profile.get(CONFIG_KEY_ARCH), f"{where}.arch")
 
     raw_routers = raw_cfg.get(CONFIG_KEY_ROUTERS, [])
     if raw_routers is not None:
@@ -908,18 +1083,19 @@ def validate_config_known_keys(raw_cfg: dict[str, object]) -> None:
                 )
 
             profile_name = raw.get(CONFIG_KEY_DEVICE_PROFILE)
-            if profile_name is not None:
-                if not isinstance(profile_name, str) or not profile_name:
-                    die(f"{where}.device_profile must be a non-empty string")
-                require_file_identifier(profile_name, f"{where}.device_profile")
-                raw_profiles_for_check = raw_cfg.get(CONFIG_KEY_DEVICE_PROFILES, {})
-                if (
-                    isinstance(raw_profiles_for_check, dict)
-                    and profile_name not in raw_profiles_for_check
-                ):
-                    die(
-                        f"{where}.device_profile references unknown profile: {profile_name}"
-                    )
+            if profile_name is None:
+                die(f"{where}.device_profile is required")
+            if not isinstance(profile_name, str) or not profile_name:
+                die(f"{where}.device_profile must be a non-empty string")
+            require_file_identifier(profile_name, f"{where}.device_profile")
+            raw_profiles_for_check = raw_cfg.get(CONFIG_KEY_DEVICE_PROFILES, {})
+            if (
+                isinstance(raw_profiles_for_check, dict)
+                and profile_name not in raw_profiles_for_check
+            ):
+                die(
+                    f"{where}.device_profile references unknown profile: {profile_name}"
+                )
 
             for wifi_key in WIFI_CONFIG_KEYS:
                 wifi = raw.get(wifi_key)
@@ -1070,6 +1246,18 @@ def canonical_ipv4(ip: str) -> str:
     return ".".join(str(n) for n in parse_ipv4(ip))
 
 
+def require_usable_unicast_ipv4_address(ip: str, where: str) -> None:
+    addr = ipaddress.IPv4Address(ip)
+    if (
+        addr.is_unspecified
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or ip == "255.255.255.255"
+    ):
+        die(f"{where} must be a usable unicast IPv4 address: {ip}")
+
+
 def ipv4_without_prefix(ip: str) -> str:
     return ip.split("/", 1)[0]
 
@@ -1094,9 +1282,11 @@ def normalize_listen_ip(value: object, where: str) -> str:
     if ":" in host:
         die(f"{where} must contain only IPv4 address without port: {host}")
     try:
-        return canonical_ipv4(host)
+        ip = canonical_ipv4(host)
     except ValueError:
         die(f"{where} must be a canonical IPv4 address when set: {host}")
+    require_usable_unicast_ipv4_address(ip, where)
+    return ip
 
 
 def load_bool(value: object, where: str, *, default: bool = False) -> bool:
@@ -1110,15 +1300,19 @@ def load_bool(value: object, where: str, *, default: bool = False) -> bool:
 def normalize_optional_exit_ip(value: object, where: str) -> str:
     if value is None:
         return ""
-    host = str(value).strip()
+    if not isinstance(value, str):
+        die(f"{where} must be an IPv4 address string when set")
+    host = value.strip()
     if not host:
         return ""
     if ":" in host:
         die(f"{where} must contain only IPv4 address without port: {host}")
     try:
-        return canonical_ipv4(host)
+        ip = canonical_ipv4(host)
     except ValueError:
         die(f"{where} must be a canonical IPv4 address when set: {host}")
+    require_usable_unicast_ipv4_address(ip, where)
+    return ip
 
 
 def stable_generated_network_for_key(
@@ -1227,13 +1421,10 @@ def exit_ipip_endpoint_ip(hub: ExitHub) -> str:
 
 
 def router_exit_ipip_iface_name(hub_name: str) -> str:
-    # OpenWrt ipip proto creates a Linux device named "ipip-$section".
-    # Keep the section short enough for IFNAMSIZ=16, but readable for short names.
-    safe = re.sub(r"[^A-Za-z0-9_]", "_", hub_name)
-    candidate = f"ip{safe}"
-    if len(f"ipip-{candidate}") <= 15:
-        return candidate
-    return "ip" + stable_hex(hub_name, 8)
+    # exit_hubs.name is already validated as uppercase ASCII and max 8 bytes.
+    # OpenWrt ipip proto creates a Linux device named f"ipip-ip{hub_name}",
+    # which therefore always fits the 15-byte visible Linux interface limit.
+    return f"ip{hub_name}"
 
 
 def load_exit_order_groups(
@@ -1473,16 +1664,29 @@ def infra_awg_port_range() -> PortRange:
 
 
 def normalize_ipv4_subnet_24_prefix(value: object, where: str) -> str:
-    raw = str(value).strip()
-    m = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0/24", raw)
-    if not m:
+    if not isinstance(value, str) or not value.strip():
         die(f"{where} must be an IPv4 /24 subnet like '10.10.1.0/24'")
+
+    raw = value.strip()
+    m = re.fullmatch(
+        r"((?:0|[1-9][0-9]{0,2}))"
+        r"\.((?:0|[1-9][0-9]{0,2}))"
+        r"\.((?:0|[1-9][0-9]{0,2}))"
+        r"\.0/24",
+        raw,
+    )
+    if not m:
+        die(f"{where} must be a canonical IPv4 /24 subnet like '10.10.1.0/24'")
 
     nums = [int(x) for x in m.groups()]
     if any(n < IPV4_OCTET_MIN or n > IPV4_OCTET_MAX for n in nums):
         die(f"{where} has invalid octet: {raw}")
 
-    return ".".join(str(n) for n in nums)
+    prefix = ".".join(str(n) for n in nums)
+    if raw != f"{prefix}.0/24":
+        die(f"{where} must be canonical IPv4 /24 subnet: {raw}")
+
+    return prefix
 
 
 def stable_hex(seed: str, length: int) -> str:
@@ -2088,7 +2292,67 @@ def load_json_config(path: Path) -> dict[str, object]:
     return raw
 
 
-def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
+def load_config_packages(raw_cfg: dict[str, object]) -> list[str]:
+    raw_packages = raw_cfg.get(CONFIG_KEY_PACKAGES, [])
+    if raw_packages is None:
+        raw_packages = []
+    return normalize_config_package_list(
+        raw_packages,
+        "config.packages",
+        allow_empty=True,
+        router_override=False,
+    )
+
+
+def load_device_profiles(raw_cfg: dict[str, object]) -> dict[str, DeviceProfile]:
+    raw_profiles = raw_cfg.get(CONFIG_KEY_DEVICE_PROFILES)
+    if not isinstance(raw_profiles, dict):
+        die("config key 'device_profiles' must be an object")
+
+    profiles: dict[str, DeviceProfile] = {}
+    seen_slugs: dict[str, str] = {}
+    for profile_name, raw_profile in raw_profiles.items():
+        require_file_identifier(
+            profile_name,
+            f"device_profiles[{profile_name}] profile name",
+        )
+        slug = profile_name.lower()
+        other_name = seen_slugs.get(slug)
+        if other_name is not None:
+            die(
+                "duplicate device profile name after lowercase: "
+                f"{profile_name} conflicts with {other_name}"
+            )
+        seen_slugs[slug] = profile_name
+
+        if not isinstance(raw_profile, dict):
+            die(f"device_profiles[{profile_name}] must be an object")
+        where = f"device_profiles[{profile_name}]"
+        require_known_keys(raw_profile, where, DEVICE_PROFILE_KEYS)
+
+        board = raw_profile.get(CONFIG_KEY_BOARD)
+        arch = raw_profile.get(CONFIG_KEY_ARCH)
+        require_device_profile_board(board, f"{where}.board")
+        require_device_profile_arch(arch, f"{where}.arch")
+
+        assert isinstance(board, str)
+        assert isinstance(arch, str)
+        target, subtarget = board.split("/", 1)
+        profiles[profile_name] = DeviceProfile(
+            name=profile_name,
+            board=board,
+            arch=arch,
+            target=target,
+            subtarget=subtarget,
+        )
+
+    return profiles
+
+
+def load_routers(
+    raw_cfg: dict[str, object],
+    device_profiles: dict[str, DeviceProfile],
+) -> list[RouterDef]:
     validate_config_known_keys(raw_cfg)
 
     routers: list[RouterDef] = []
@@ -2118,6 +2382,28 @@ def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
         )
         subnet = f"{subnet_prefix}.0/{ACCESS_SUBNET_CIDR}"
 
+        profile_name = raw.get(CONFIG_KEY_DEVICE_PROFILE)
+        if not isinstance(profile_name, str) or not profile_name:
+            die(f"routers[{idx}].device_profile must be a non-empty string")
+        require_file_identifier(profile_name, f"routers[{idx}].device_profile")
+        if profile_name not in device_profiles:
+            die(
+                f"routers[{idx}].device_profile references unknown profile: "
+                f"{profile_name}"
+            )
+
+        raw_packages = raw.get(CONFIG_KEY_PACKAGES, [])
+        if raw_packages is None:
+            raw_packages = []
+        package_overrides = tuple(
+            normalize_config_package_list(
+                raw_packages,
+                f"routers[{name}].packages",
+                allow_empty=True,
+                router_override=True,
+            )
+        )
+
         if name in seen_names:
             die(f"duplicate router.name: {name}")
         slug = name.lower()
@@ -2133,7 +2419,14 @@ def load_routers(raw_cfg: dict[str, object]) -> list[RouterDef]:
         seen_names.add(name)
         seen_slugs[slug] = name
         seen_subnets.add(subnet)
-        routers.append(RouterDef(name=name, subnet=subnet))
+        routers.append(
+            RouterDef(
+                name=name,
+                subnet=subnet,
+                device_profile=profile_name,
+                package_overrides=package_overrides,
+            )
+        )
 
     return routers
 
@@ -2512,8 +2805,58 @@ def mesh_firewall_rule_name(_hub_name: str, target_name: str) -> str:
     return f"Allow-Mesh-{target_name}"
 
 
+def config_network_item(text: str, where: str) -> tuple[str, ipaddress.IPv4Network]:
+    try:
+        return where, ipaddress.IPv4Network(text, strict=True)
+    except ValueError as e:
+        die(f"{where} is not a valid IPv4 network: {e}")
+
+
+def validate_config_networks_do_not_overlap(
+    routers: list[RouterDef],
+    access: dict[str, list[AccessGroup]],
+) -> None:
+    items: list[tuple[str, ipaddress.IPv4Network]] = []
+
+    for router in routers:
+        items.append(
+            config_network_item(router.subnet, f"routers[{router.name}].subnet")
+        )
+
+    for router_name, groups in access.items():
+        for group in groups:
+            subnet = f"{group.subnet}.0/{ACCESS_SUBNET_CIDR}"
+            items.append(
+                config_network_item(
+                    subnet,
+                    f"access[{router_name}][{group.name}].subnet",
+                )
+            )
+
+    for where, subnet in (
+        ("INFRA_LINK_POOL", INFRA_LINK_POOL),
+        ("EXIT_ANNOUNCE_SUPERNET4", EXIT_ANNOUNCE_SUPERNET4),
+        ("EXIT_NODE_SUPERNET4", EXIT_NODE_SUPERNET4),
+    ):
+        items.append(config_network_item(subnet, where))
+
+    for left_idx, (left_where, left_net) in enumerate(items):
+        for right_where, right_net in items[left_idx + 1 :]:
+            if left_net.overlaps(right_net):
+                die(
+                    "IPv4 subnets must not overlap: "
+                    f"{left_where}={left_net} overlaps {right_where}={right_net}"
+                )
+
+
 def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
-    routers = load_routers(raw_cfg)
+    openwrt_version = normalize_openwrt_version(
+        raw_cfg.get(CONFIG_KEY_OPENWRT_VERSION),
+        "config.openwrt_version",
+    )
+    packages = load_config_packages(raw_cfg)
+    device_profiles = load_device_profiles(raw_cfg)
+    routers = load_routers(raw_cfg, device_profiles)
     router_by_name = {r.name: r for r in routers}
     router_names = [r.name for r in routers]
 
@@ -2640,6 +2983,12 @@ def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
             if port in seen_access_ports:
                 die(f"duplicate access port on {router_name}: {port}")
             seen_access_ports.add(port)
+            infra_ports = infra_awg_port_range()
+            if infra_ports.start <= port <= infra_ports.end:
+                die(
+                    f"{where}.port conflicts with infra AWG port range "
+                    f"{infra_ports}: {port}"
+                )
 
             users_raw = raw.get(CONFIG_KEY_USERS)
             if not isinstance(users_raw, list):
@@ -2701,10 +3050,17 @@ def build_config_data(raw_cfg: dict[str, object]) -> ConfigData:
                 f"add mesh_hubs entry with listen_ip, or use access_only=true"
             )
 
+    validate_router_package_policy(routers, packages, access)
+    validate_config_networks_do_not_overlap(routers, access)
+
     return ConfigData(
         routers=routers,
         router_by_name=router_by_name,
         router_names=router_names,
+        openwrt_version=openwrt_version,
+        main_router=main_router,
+        packages=packages,
+        device_profiles=device_profiles,
         mesh_hubs=mesh_hubs,
         mesh_hubs_by_name=mesh_hubs_by_name,
         access_endpoints=access_endpoints,

@@ -10,8 +10,13 @@ import io
 import os
 import re
 from pathlib import Path
-from common import *
-from sync_rules import SYNC_COPY_DIRS, SYNC_COPY_FILES, SYNC_MERGE_FILES
+
+try:
+    from .common import *
+    from .sync_rules import SYNC_COPY_DIRS, SYNC_COPY_FILES, SYNC_MERGE_FILES
+except ImportError:
+    from common import *
+    from sync_rules import SYNC_COPY_DIRS, SYNC_COPY_FILES, SYNC_MERGE_FILES
 
 try:
     import generate as gen
