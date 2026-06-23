@@ -1097,7 +1097,6 @@ ssh, scp, ssh-keygen
 age, age-keygen
 wg
 openssl
-apk / apk-tools
 wget
 tar с поддержкой zst
 make
